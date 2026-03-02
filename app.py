@@ -189,7 +189,6 @@ if uploaded_file:
             
         res_state = "VIC" if re.search(r"\bVIC\b|Victoria", full_text, re.I) else "NSW"
 
-        # 1. Establish the Unit Prices (Pre-Math)
         audit_list = []
         for _, row in summary_df.iterrows():
             is_third_party = (str(row['Date']).strip() == "")
@@ -238,7 +237,7 @@ if uploaded_file:
 
         with t3:
             st.write("### Source of Truth: Timesheet Verification")
-            st.info("💡 **Auditor Input Required:** Ensure all dates from the summary have corresponding hours verified here. **The final financial audit will use THESE hours, not the summary hours.**")
+            st.info("💡 **Auditor Input Required:** Verify the hours below. The app will wait for you to finish typing. Click **Confirm & Save Hours** when done.")
             
             summary_dates = [d for d in summary_df['Date'] if str(d).strip() != ""]
             for d in summary_dates:
@@ -249,7 +248,11 @@ if uploaded_file:
             if not init_data: init_data = [{"Date": "", "Verified Hours": 0.0}]
             log_df = pd.DataFrame(init_data)
             
-            edited_log_df = st.data_editor(log_df, num_rows="dynamic", use_container_width=True, key="timesheet_editor")
+            # --- THE FIX: FORM WRAPPER ---
+            with st.form("timesheet_form"):
+                edited_log_df = st.data_editor(log_df, num_rows="dynamic", use_container_width=True, key="timesheet_editor")
+                submit_button = st.form_submit_button("Confirm & Save Hours")
+            
             verified_hrs_dict = edited_log_df[edited_log_df['Date'].str.strip() != ""].groupby('Date')['Verified Hours'].sum().to_dict()
             
             st.write("---")
@@ -273,14 +276,12 @@ if uploaded_file:
             
             available_verified_hrs = verified_hrs_dict.copy()
 
-            # --- THE FIX: USE VENDOR'S PRICE FOR FINANCIAL MATH ---
             for i, row in summary_df.iterrows():
                 is_third_party = (str(row['Date']).strip() == "")
                 
                 if is_third_party:
                     expected_nontaxable_subtotal += row['Subtotal']
                 else:
-                    # We grab the Vendor's printed price for this specific calculation
                     billed_unit_price = row['Price'] 
                     date_val = row['Date']
                     billed_qty = row['Qty']
