@@ -93,7 +93,7 @@ def process_pdf(uploaded_file):
             if current_doc_type == "MIRAE_SUMMARY" and mirae_summary_ended:
                 current_doc_type = "THIRD_PARTY"
             
-            # Mode A: Timesheets (Digital Extraction Only)
+            # Mode A: Timesheets 
             if current_doc_type == "TIMESHEET":
                 extracted_from_page = False
                 tables = page.extract_tables()
@@ -200,12 +200,9 @@ if uploaded_file:
                 for key in PRICE_REF:
                     if key in str(row['Service']).upper():
                         exp_unit_price = PRICE_REF[key].get(dtype, 0.0); break
-                exp_subtotal = exp_unit_price * row['Qty']
                 match_status = "MATCH" if abs(exp_unit_price - row['Price']) < 0.01 else "MISMATCH"
             else:
-                # If it's a surcharge or 3rd party, we just trust the billed subtotal
                 exp_unit_price = row['Price'] if row['Price'] > 0 else row['Subtotal']
-                exp_subtotal = row['Subtotal']
                 match_status = "N/A"
                 
             audit_list.append({"Day": dtype, "Expected Unit": exp_unit_price, "Match": match_status})
@@ -276,25 +273,30 @@ if uploaded_file:
             
             available_verified_hrs = verified_hrs_dict.copy()
 
+            # --- THE FIX: USE VENDOR'S PRICE FOR FINANCIAL MATH ---
             for i, row in summary_df.iterrows():
                 is_third_party = (str(row['Date']).strip() == "")
                 
                 if is_third_party:
-                    # Explicitly pull the exact subtotal for surcharges and bypass GST
                     expected_nontaxable_subtotal += row['Subtotal']
                 else:
-                    exp_unit_price = audit_meta_df.loc[i, "Expected Unit"]
+                    # We grab the Vendor's printed price for this specific calculation
+                    billed_unit_price = row['Price'] 
                     date_val = row['Date']
-                    qty_to_use = available_verified_hrs.get(date_val, 0.0)
-                    expected_taxable_subtotal += (exp_unit_price * qty_to_use)
-                    available_verified_hrs[date_val] = 0.0
+                    billed_qty = row['Qty']
+                    
+                    available = available_verified_hrs.get(date_val, 0.0)
+                    qty_to_use = min(billed_qty, available) if billed_qty > 0 else 0.0
+                    
+                    expected_taxable_subtotal += (billed_unit_price * qty_to_use)
+                    available_verified_hrs[date_val] = round(available - qty_to_use, 2)
 
             calc_gst = round(expected_taxable_subtotal * 0.1, 2)
             calc_grand_total = expected_taxable_subtotal + expected_nontaxable_subtotal + calc_gst
             
             st.markdown(f"""
             **Breakdown of your Verified Math:**
-            * **Taxable Services:** ${expected_taxable_subtotal:,.2f} *(Calculated from Verified Hours x Rate Card)*
+            * **Taxable Services:** ${expected_taxable_subtotal:,.2f} *(Calculated from Verified Hours x Vendor's Unit Price)*
             * **Non-Taxable Items (Surcharges/3rd Party):** ${expected_nontaxable_subtotal:,.2f} *(Pulled directly from Summary)*
             """)
             
