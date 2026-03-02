@@ -88,7 +88,7 @@ def process_pdf(uploaded_file, ocr_reader):
             
             # FAST PRE-READ: If page is a flat photo, grab basic text to feed the State Machine
             if len(text.strip()) < 50:
-                pil_image = page.to_image(resolution=100).original.convert('RGB')
+                pil_image = page.to_image(resolution=72).original.convert('RGB')
                 ocr_basic = ocr_reader.readtext(np.array(pil_image), detail=0)
                 text_upper += " " + " ".join(ocr_basic).upper()
                 
