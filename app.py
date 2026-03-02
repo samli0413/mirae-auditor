@@ -5,11 +5,6 @@ import re
 import holidays
 from datetime import datetime
 import numpy as np
-import easyocr
-import logging
-
-# Suppress debug warnings
-logging.getLogger().setLevel(logging.ERROR)
 
 # --- CONFIGURATION & PRICING ---
 PRICE_REF = {
@@ -21,11 +16,6 @@ PRICE_REF = {
     "MEAL PREP": {"Standard": 78.0, "Saturday": 109.2, "Sunday": 132.6, "Public Holiday": 171.6},
     "TRANSPORT": {"Standard": 70.0, "Saturday": 98.0, "Sunday": 119.0, "Public Holiday": 154.0}
 }
-
-# --- CACHE THE AI MODEL SO THE APP STAYS FAST ---
-@st.cache_resource
-def get_ocr_reader():
-    return easyocr.Reader(['en'])
 
 # --- HELPER FUNCTIONS ---
 def get_day_type_info(date_str, state_code):
@@ -71,11 +61,12 @@ def highlight_day(val):
     return ''
 
 # --- CORE EXTRACTION ENGINE ---
-def process_pdf(uploaded_file, ocr_reader):
+def process_pdf(uploaded_file):
     summary_rows = []
     timesheet_hours = {}
     third_party_totals = []
     full_text = ""
+    photo_detected = False
     
     current_doc_type = "UNKNOWN"
     mirae_summary_ended = False 
@@ -86,22 +77,18 @@ def process_pdf(uploaded_file, ocr_reader):
             full_text += text + "\n"
             text_upper = text.upper()
             
-            # FAST PRE-READ: If page is a flat photo, grab basic text to feed the State Machine
+            # Identify if it's a flat image
             if len(text.strip()) < 50:
-                pil_image = page.to_image(resolution=72).original.convert('RGB')
-                ocr_basic = ocr_reader.readtext(np.array(pil_image), detail=0)
-                text_upper += " " + " ".join(ocr_basic).upper()
+                photo_detected = True
                 
-            # Clean spaces so "S E R V I C E" matches "SERVICE"
             text_clean = re.sub(r'\s+', '', text_upper)
             
-            # --- BULLETPROOF STATE DETECTION ---
+            # --- STRICT STATE DETECTION ---
             if "SERVICECONFIRMATION" in text_clean or "TIMESHEET" in text_clean:
                 current_doc_type = "TIMESHEET"
             elif "MIRAE" in text_clean and ("TAXINVOICE" in text_clean or "INVOICE" in text_clean):
                 current_doc_type = "MIRAE_SUMMARY"
             elif current_doc_type == "MIRAE_SUMMARY":
-                # THE FAILSAFE: If we turn the page and MIRAE is missing, the summary is over.
                 if "MIRAE" not in text_clean:
                     current_doc_type = "THIRD_PARTY"
             
@@ -136,22 +123,6 @@ def process_pdf(uploaded_file, ocr_reader):
                                 if hours > 24 and len(hr_match) > 1: hours = float(hr_match[-2])
                                 if 0 < hours <= 24:
                                     timesheet_hours[date_val] = timesheet_hours.get(date_val, 0) + hours
-                                    extracted_from_page = True
-
-                # Deep OCR for missing hours
-                if not extracted_from_page:
-                    pil_image = page.to_image(resolution=150).original.convert('RGB')
-                    img_array = np.array(pil_image)
-                    ocr_result = ocr_reader.readtext(img_array)
-                    
-                    if ocr_result:
-                        ocr_text = " ".join([res[1] for res in ocr_result])
-                        matches = re.finditer(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}).{1,60}?\b(\d+(?:\.\d+)?)\b", ocr_text)
-                        for m in matches:
-                            date_val = normalize_date(m.group(1))
-                            hours = float(m.group(2))
-                            if 0 < hours <= 24:
-                                timesheet_hours[date_val] = timesheet_hours.get(date_val, 0) + hours
 
             # Mode B: Mirae Summary
             elif current_doc_type == "MIRAE_SUMMARY":
@@ -204,19 +175,21 @@ def process_pdf(uploaded_file, ocr_reader):
     for col in ['Price', 'Qty', 'Subtotal']:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
     
-    return df, timesheet_hours, third_party_totals, full_text
+    return df, timesheet_hours, third_party_totals, full_text, photo_detected
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Mirae Smart Auditor", layout="wide")
 st.title("Mirae Smart Auditor")
 
-ocr_reader = get_ocr_reader()
-
 uploaded_file = st.file_uploader("Upload Tax Invoice (PDF)", type="pdf")
 
 if uploaded_file:
-    with st.spinner("Extracting multi-page data and running OCR..."):
-        summary_df, auto_timesheet_hours, third_party_totals, full_text = process_pdf(uploaded_file, ocr_reader)
+    with st.spinner("Extracting and auditing data..."):
+        summary_df, auto_timesheet_hours, third_party_totals, full_text, photo_detected = process_pdf(uploaded_file)
+        
+        if photo_detected:
+            st.toast("Scanned timesheet detected. Please verify hours manually in the Human-in-the-Loop tab.", icon="⚠️")
+            
         res_state = "VIC" if re.search(r"\bVIC\b|Victoria", full_text, re.I) else "NSW"
 
         audit_list = []
@@ -336,4 +309,3 @@ if uploaded_file:
                 c_data.write(f"**{d}** | Timesheet Entry: **{lh}** hrs vs Summary Bill: **{sh}** hrs")
                 if abs(lh - sh) < 0.01: c_status.success("MATCH")
                 else: c_status.error("MISMATCH")
-
