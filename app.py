@@ -76,13 +76,12 @@ def process_pdf(uploaded_file):
             full_text += text + "\n"
             text_upper = text.upper()
             
-            # Identify if it's a flat image
             if len(text.strip()) < 50:
                 photo_detected = True
                 
             text_clean = re.sub(r'\s+', '', text_upper)
             
-            # --- STRICT STATE DETECTION ---
+            # STATE DETECTION
             if "SERVICECONFIRMATION" in text_clean or "TIMESHEET" in text_clean:
                 current_doc_type = "TIMESHEET"
             elif "MIRAE" in text_clean and ("TAXINVOICE" in text_clean or "INVOICE" in text_clean):
@@ -94,10 +93,9 @@ def process_pdf(uploaded_file):
             if current_doc_type == "MIRAE_SUMMARY" and mirae_summary_ended:
                 current_doc_type = "THIRD_PARTY"
             
-            # Mode A: Timesheets
+            # Mode A: Timesheets (Digital Extraction Only)
             if current_doc_type == "TIMESHEET":
                 extracted_from_page = False
-                
                 tables = page.extract_tables()
                 for table in tables:
                     for row in table:
@@ -187,44 +185,26 @@ if uploaded_file:
         summary_df, auto_timesheet_hours, third_party_totals, full_text, photo_detected = process_pdf(uploaded_file)
         
         if photo_detected:
-            st.toast("Scanned timesheet detected. Please verify hours manually in the Human-in-the-Loop tab.", icon="⚠️")
+            st.toast("Scanned timesheet detected! Please verify hours manually in the Timesheet Verification tab.", icon="⚠️")
             
         res_state = "VIC" if re.search(r"\bVIC\b|Victoria", full_text, re.I) else "NSW"
 
+        # 1. Establish the Unit Prices (Pre-Math)
         audit_list = []
-        expected_taxable_subtotal = 0.0
-        expected_nontaxable_subtotal = 0.0
-
         for _, row in summary_df.iterrows():
             is_third_party = (str(row['Date']).strip() == "")
             dtype, _ = get_day_type_info(row['Date'], res_state) if not is_third_party else ("N/A", None)
             
             exp_unit_price = 0.0
-            qty = row['Qty']
-            if qty == 0 and is_third_party: qty = 1.0
-            
             if not is_third_party:
                 for key in PRICE_REF:
                     if key in str(row['Service']).upper():
                         exp_unit_price = PRICE_REF[key].get(dtype, 0.0); break
             else:
                 exp_unit_price = row['Price'] if row['Price'] > 0 else row['Subtotal']
-            
-            exp_subtotal = exp_unit_price * qty
-            
-            if is_third_party:
-                expected_nontaxable_subtotal += exp_subtotal
-                match_status = "N/A"
-            else:
-                expected_taxable_subtotal += exp_subtotal
-                match_status = "MATCH" if abs(exp_unit_price - row['Price']) < 0.01 else "MISMATCH"
                 
-            audit_list.append({
-                "Day": dtype, 
-                "Expected Unit": exp_unit_price, 
-                "Expected Subtotal": exp_subtotal,
-                "Match": match_status
-            })
+            match_status = "N/A" if is_third_party else ("MATCH" if abs(exp_unit_price - row['Price']) < 0.01 else "MISMATCH")
+            audit_list.append({"Day": dtype, "Expected Unit": exp_unit_price, "Match": match_status})
         
         audit_meta_df = pd.DataFrame(audit_list)
 
@@ -235,7 +215,8 @@ if uploaded_file:
         st.sidebar.write(f"**Detected State:** {res_state}")
         st.sidebar.write(f"**Third-Party Source Docs Total:** ${sum(third_party_totals):.2f}")
 
-        t1, t2, t3, t4 = st.tabs(["Summary Data", "Unit Price Audit", "Financial Audit", "Hour Verification"])
+        # REORDERED TABS for logical workflow
+        t1, t2, t3, t4 = st.tabs(["1. Summary Data", "2. Unit Price Audit", "3. Timesheet Verification", "4. Final Financial Audit"])
         
         with t1:
             st.write("### Extracted Summary Table")
@@ -249,17 +230,70 @@ if uploaded_file:
                 audit_meta_df[['Day', 'Expected Unit', 'Match']]
             ], axis=1)
             display_audit_df = display_audit_df.rename(columns={"Price": "Billed Unit"})
-            
             try:
                 styled_df = display_audit_df.style.map(highlight_match, subset=['Match']).map(highlight_day, subset=['Day'])
             except AttributeError:
                 styled_df = display_audit_df.style.applymap(highlight_match, subset=['Match']).applymap(highlight_day, subset=['Day'])
-                
             st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
         with t3:
-            st.write("### Financial Reconciliation (Rate-Card Based)")
+            st.write("### Source of Truth: Timesheet Verification")
+            st.info("💡 **Auditor Input Required:** Ensure all dates from the summary have corresponding hours verified here. **The final financial audit will use THESE hours, not the summary hours.**")
             
+            # SMART UX: Ensure every date billed in the summary exists in the editor so the user doesn't have to type them
+            summary_dates = [d for d in summary_df['Date'] if str(d).strip() != ""]
+            for d in summary_dates:
+                if d not in auto_timesheet_hours:
+                    auto_timesheet_hours[d] = 0.0 # Creates a blank entry for the auditor to fill
+                    
+            init_data = [{"Date": d, "Verified Hours": auto_timesheet_hours[d]} for d in sorted(auto_timesheet_hours.keys())]
+            if not init_data: init_data = [{"Date": "", "Verified Hours": 0.0}]
+            log_df = pd.DataFrame(init_data)
+            
+            # THE EDITOR
+            edited_log_df = st.data_editor(log_df, num_rows="dynamic", use_container_width=True, key="timesheet_editor")
+            
+            # Group verified hours by Date so we can pass them to the math tab
+            verified_hrs_dict = edited_log_df[edited_log_df['Date'].str.strip() != ""].groupby('Date')['Verified Hours'].sum().to_dict()
+            
+            st.write("---")
+            st.write("#### Timesheet vs Summary Cross-Check")
+            sum_hrs = summary_df[summary_df['Date'] != ""].groupby('Date')['Qty'].sum()
+            all_dates = sorted(list(set(sum_hrs.index).union(set(verified_hrs_dict.keys()))))
+            
+            for d in all_dates:
+                sh = sum_hrs.get(d, 0.0)
+                lh = verified_hrs_dict.get(d, 0.0)
+                c_data, c_status = st.columns([6, 1])
+                c_data.write(f"**{d}** | Verified Entry: **{lh}** hrs vs Billed Summary: **{sh}** hrs")
+                if abs(lh - sh) < 0.01: c_status.success("MATCH")
+                else: c_status.error("MISMATCH")
+
+        with t4:
+            st.write("### Final Financial Reconciliation")
+            st.info("💡 **Ultimate Audit:** The 'System Calculated' totals below are generated by multiplying the **Verified Hours** (from Tab 3) by the **Expected Rate-Card Unit Price** (from Tab 2).")
+            
+            expected_taxable_subtotal = 0.0
+            expected_nontaxable_subtotal = 0.0
+            
+            # Create a consumable copy of verified hours so we don't double-count if multiple services occur on the same day
+            available_verified_hrs = verified_hrs_dict.copy()
+
+            for i, row in summary_df.iterrows():
+                is_third_party = (str(row['Date']).strip() == "")
+                exp_unit_price = audit_meta_df.loc[i, "Expected Unit"]
+                
+                if is_third_party:
+                    qty_to_use = row['Qty'] if row['Qty'] > 0 else 1.0
+                    expected_nontaxable_subtotal += (exp_unit_price * qty_to_use)
+                else:
+                    date_val = row['Date']
+                    # THE MAGIC: Pull the hours purely from the user's verified input
+                    qty_to_use = available_verified_hrs.get(date_val, 0.0)
+                    expected_taxable_subtotal += (exp_unit_price * qty_to_use)
+                    # Clear it so it isn't applied to a second service on the same day by accident
+                    available_verified_hrs[date_val] = 0.0
+
             calc_gst = round(expected_taxable_subtotal * 0.1, 2)
             calc_grand_total = expected_taxable_subtotal + expected_nontaxable_subtotal + calc_gst
             
@@ -269,42 +303,18 @@ if uploaded_file:
             user_tot = col3.number_input("PDF Grand Total ($)", value=float(s_tot), format="%.2f")
             
             st.write("---")
-            st.write("#### Comparison Results")
+            st.write("#### Bottom-Line Comparison")
             recon_data = [
-                {"Metric": "Item Total", "Calc": expected_taxable_subtotal + expected_nontaxable_subtotal, "Summary": user_it},
-                {"Metric": "GST (10%)", "Calc": calc_gst, "Summary": user_gst},
-                {"Metric": "Grand Total", "Calc": calc_grand_total, "Summary": user_tot}
+                {"Metric": "Verified Item Total", "Calc": expected_taxable_subtotal + expected_nontaxable_subtotal, "Summary": user_it},
+                {"Metric": "Verified GST (10%)", "Calc": calc_gst, "Summary": user_gst},
+                {"Metric": "Verified Grand Total", "Calc": calc_grand_total, "Summary": user_tot}
             ]
             
             for m in recon_data:
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
                 diff = round(m['Calc'] - m['Summary'], 2)
                 c1.write(f"**{m['Metric']}**")
-                c2.write(f"Verified Expected: ${m['Calc']:,.2f}")
-                c3.write(f"PDF Value: ${m['Summary']:,.2f}")
+                c2.write(f"System Calculated: ${m['Calc']:,.2f}")
+                c3.write(f"Billed by Vendor: ${m['Summary']:,.2f}")
                 if abs(diff) < 0.05: c4.success("MATCH")
-                else: c4.error(f"DIFF: ${diff}")
-
-        with t4:
-            st.write("### Human-in-the-Loop: Timesheet Hour Verification")
-            
-            init_data = [{"Date": d, "Logged Hours": h} for d, h in auto_timesheet_hours.items()]
-            if not init_data: init_data = [{"Date": "", "Logged Hours": 0.0}]
-            log_df = pd.DataFrame(init_data)
-            
-            edited_log_df = st.data_editor(log_df, num_rows="dynamic", use_container_width=True, key="timesheet_editor")
-            
-            st.write("---")
-            st.write("#### Reconciliation vs Summary")
-            
-            sum_hrs = summary_df[summary_df['Date'] != ""].groupby('Date')['Qty'].sum()
-            edited_hrs = edited_log_df[edited_log_df['Date'].str.strip() != ""].groupby('Date')['Logged Hours'].sum()
-            all_dates = sorted(list(set(sum_hrs.index).union(set(edited_hrs.index))))
-            
-            for d in all_dates:
-                sh = sum_hrs.get(d, 0.0)
-                lh = edited_hrs.get(d, 0.0)
-                c_data, c_status = st.columns([6, 1])
-                c_data.write(f"**{d}** | Timesheet Entry: **{lh}** hrs vs Summary Bill: **{sh}** hrs")
-                if abs(lh - sh) < 0.01: c_status.success("MATCH")
-                else: c_status.error("MISMATCH")
+                else: c4.error(f"OVERCHARGED: ${abs(diff):,.2f}" if diff < 0 else f"UNDERCHARGED: ${diff:,.2f}")
