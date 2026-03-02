@@ -1,10 +1,5 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
 streamlit==1.37.0
 pdfplumber
 pandas
 holidays
 numpy
-easyocr
-Pillow
