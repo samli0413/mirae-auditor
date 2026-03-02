@@ -1,0 +1,7 @@
+streamlit
+pdfplumber
+pandas
+holidays
+numpy
+easyocr
+Pillow
