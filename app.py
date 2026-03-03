@@ -213,9 +213,14 @@ if uploaded_file:
         s_tot = fetch_val(r"(?<!Item\s)Total\s*[:$]*\s*([\d,]+\.\d{2})", full_text)
 
         st.sidebar.write(f"**Detected State:** {res_state}")
-        st.sidebar.write(f"**Third-Party Source Docs Total:** ${sum(third_party_totals):.2f}")
 
-        t1, t2, t3, t4 = st.tabs(["1. Summary Data", "2. Unit Price Audit", "3. Timesheet Verification", "4. Final Financial Audit"])
+        t1, t2, t3, t4, t5 = st.tabs([
+            "1. Summary Data", 
+            "2. Unit Price Audit", 
+            "3. Timesheet Verification", 
+            "4. Third-Party Receipts", 
+            "5. Final Financial Audit"
+        ])
         
         with t1:
             st.write("### Extracted Summary Table")
@@ -248,7 +253,6 @@ if uploaded_file:
             if not init_data: init_data = [{"Date": "", "Verified Hours": 0.0}]
             log_df = pd.DataFrame(init_data)
             
-            # --- THE FIX: FORM WRAPPER ---
             with st.form("timesheet_form"):
                 edited_log_df = st.data_editor(log_df, num_rows="dynamic", use_container_width=True, key="timesheet_editor")
                 submit_button = st.form_submit_button("Confirm & Save Hours")
@@ -269,19 +273,77 @@ if uploaded_file:
                 else: c_status.error("MISMATCH")
 
         with t4:
+            st.write("### Source of Truth: Third-Party Receipts")
+            st.info("💡 **Auditor Input Required:** Verify the raw receipt amounts below. The app will automatically calculate the 10% surcharge for each item.")
+            
+            # 1. The Raw Input Editor
+            tp_init_data = [{"Receipt Ref": f"Extracted Receipt {i+1}", "Raw Amount ($)": val} for i, val in enumerate(third_party_totals)]
+            if not tp_init_data: tp_init_data = [{"Receipt Ref": "Manual Entry 1", "Raw Amount ($)": 0.0}]
+            tp_df = pd.DataFrame(tp_init_data)
+            
+            with st.form("third_party_form"):
+                edited_tp_df = st.data_editor(tp_df, num_rows="dynamic", use_container_width=True, key="tp_editor")
+                st.form_submit_button("Confirm & Calculate")
+                
+            # 2. The Auto-Calculation Breakdown
+            st.write("#### 1. Your Calculated Receipt Breakdown")
+            
+            # Perform the math row-by-row
+            edited_tp_df['10% Surcharge ($)'] = (edited_tp_df['Raw Amount ($)'] * 0.10).round(2)
+            edited_tp_df['Total Calculated ($)'] = (edited_tp_df['Raw Amount ($)'] + edited_tp_df['10% Surcharge ($)']).round(2)
+            
+            # Force Streamlit to display two decimal places for currency
+            st.dataframe(
+                edited_tp_df, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Raw Amount ($)": st.column_config.NumberColumn(format="%.2f"),
+                    "10% Surcharge ($)": st.column_config.NumberColumn(format="%.2f"),
+                    "Total Calculated ($)": st.column_config.NumberColumn(format="%.2f")
+                }
+            )
+            
+            # 3. Vendor's Summary Claim
+            st.write("#### 2. Claimed on Vendor Summary")
+            summary_tp_df = summary_df[summary_df['Date'] == ''][['Service', 'Subtotal']].rename(columns={"Service": "Billed Item", "Subtotal": "Claimed Total ($)"})
+            
+            if summary_tp_df.empty:
+                st.write("*No third-party items found on the summary page.*")
+            else:
+                st.dataframe(
+                    summary_tp_df, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={"Claimed Total ($)": st.column_config.NumberColumn(format="%.2f")}
+                )
+            
+            # 4. The Final Cross-Check
+            verified_tp_sum = edited_tp_df['Total Calculated ($)'].sum()
+            claimed_tp_sum = summary_tp_df['Claimed Total ($)'].sum()
+            
+            st.write("---")
+            st.write("#### 3. Receipts vs Summary Cross-Check")
+            
+            c_data, c_status = st.columns([6, 1])
+            c_data.write(f"**Calculated from Receipts:** **${verified_tp_sum:,.2f}** vs **Billed on Summary:** **${claimed_tp_sum:,.2f}**")
+            if abs(verified_tp_sum - claimed_tp_sum) < 0.01: c_status.success("MATCH")
+            else: c_status.error("MISMATCH")
+
+        with t5:
             st.write("### Final Financial Reconciliation")
             
             expected_taxable_subtotal = 0.0
-            expected_nontaxable_subtotal = 0.0
+            
+            # Send the fully calculated total straight to the final math
+            expected_nontaxable_subtotal = verified_tp_sum 
             
             available_verified_hrs = verified_hrs_dict.copy()
 
             for i, row in summary_df.iterrows():
                 is_third_party = (str(row['Date']).strip() == "")
                 
-                if is_third_party:
-                    expected_nontaxable_subtotal += row['Subtotal']
-                else:
+                if not is_third_party:
                     billed_unit_price = row['Price'] 
                     date_val = row['Date']
                     billed_qty = row['Qty']
@@ -297,8 +359,8 @@ if uploaded_file:
             
             st.markdown(f"""
             **Breakdown of your Verified Math:**
-            * **Taxable Services:** ${expected_taxable_subtotal:,.2f} *(Calculated from Verified Hours x Vendor's Unit Price)*
-            * **Non-Taxable Items (Surcharges/3rd Party):** ${expected_nontaxable_subtotal:,.2f} *(Pulled directly from Summary)*
+            * **Taxable Services:** ${expected_taxable_subtotal:,.2f} *(Calculated from Tab 3 Hours x Vendor's Unit Price)*
+            * **Non-Taxable Items (3rd Party + Surcharges):** ${expected_nontaxable_subtotal:,.2f} *(Pulled strictly from Tab 4 Calculated Totals)*
             """)
             
             col1, col2, col3 = st.columns(3)
