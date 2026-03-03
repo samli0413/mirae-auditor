@@ -290,9 +290,19 @@ if uploaded_file:
             
             # Perform the math row-by-row
             edited_tp_df['10% Surcharge ($)'] = (edited_tp_df['Raw Amount ($)'] * 0.10).round(2)
-            edited_tp_df['Total Calculated ($)'] = edited_tp_df['Raw Amount ($)'] + edited_tp_df['10% Surcharge ($)']
+            edited_tp_df['Total Calculated ($)'] = (edited_tp_df['Raw Amount ($)'] + edited_tp_df['10% Surcharge ($)']).round(2)
             
-            st.dataframe(edited_tp_df, use_container_width=True, hide_index=True)
+            # Force Streamlit to display two decimal places for currency
+            st.dataframe(
+                edited_tp_df, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Raw Amount ($)": st.column_config.NumberColumn(format="%.2f"),
+                    "10% Surcharge ($)": st.column_config.NumberColumn(format="%.2f"),
+                    "Total Calculated ($)": st.column_config.NumberColumn(format="%.2f")
+                }
+            )
             
             # 3. Vendor's Summary Claim
             st.write("#### 2. Claimed on Vendor Summary")
@@ -301,7 +311,12 @@ if uploaded_file:
             if summary_tp_df.empty:
                 st.write("*No third-party items found on the summary page.*")
             else:
-                st.dataframe(summary_tp_df, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    summary_tp_df, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={"Claimed Total ($)": st.column_config.NumberColumn(format="%.2f")}
+                )
             
             # 4. The Final Cross-Check
             verified_tp_sum = edited_tp_df['Total Calculated ($)'].sum()
