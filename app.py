@@ -142,30 +142,26 @@ st.markdown("---")
 
 st.header("🗓️ 1. Care Services & Rate Audit")
 st.write("Cross-checking dates, states, and weekend/holiday penalty rates.")
-# Render the styled dataframe
 st.dataframe(styled_care_df, use_container_width=True, height=500, hide_index=True)
 st.markdown("---")
 
 st.header("💊 2. Third-Party & Reimbursements")
-col1, col2 = st.columns([2, 1])
+st.write("**Extracted Third-Party Line Items:**")
+df_third_party = df_third_party.rename(columns={"date": "Service Date", "service": "Service", "price": "Rate", "qty": "Qty", "subtotal": "Subtotal"})
+st.dataframe(df_third_party[["Service Date", "Service", "Subtotal"]], use_container_width=True, hide_index=True)
 
-with col1:
-    st.write("**Extracted Third-Party Line Items:**")
-    df_third_party = df_third_party.rename(columns={"date": "Service Date", "service": "Service", "price": "Rate", "qty": "Qty", "subtotal": "Subtotal"})
-    st.dataframe(df_third_party[["Service Date", "Service", "Subtotal"]], use_container_width=True, hide_index=True)
+# Math check excluding the "SURCHARGE" so we compare strictly base receipt to base grid claim
+ai_raw_receipts = sum(data["third_party_totals"])
+base_grid_reimbursements = df_third_party[~df_third_party['Service'].str.contains('SURCHARGE', case=False, na=False)]['Subtotal'].sum()
 
-with col2:
-    st.write("**Third-Party Math Check:**")
-    ai_raw_receipts = sum(data["third_party_totals"])
-    line_items_sum = df_third_party["Subtotal"].sum()
-    
-    st.metric(label="Isolated Receipts Found", value=f"${ai_raw_receipts:.2f}")
-    st.metric(label="Grid Line Items Total", value=f"${line_items_sum:.2f}")
-    
-    st.write("---")
-    # NEW: explicit match statement!
-    if abs(line_items_sum - ai_raw_receipts) <= 0.05:
-        st.success("✅ **Match:** The grid items equal the base receipts.")
-    else:
-        variance = line_items_sum - ai_raw_receipts
-        st.warning(f"⚠️ **Mismatch:** There is a variance of **${variance:.2f}**. (Vendor likely added a surcharge or split the receipt).")
+tp_match_status = "✅ Match" if abs(base_grid_reimbursements - ai_raw_receipts) <= 0.05 else "❌ Mismatch"
+
+tp_data = {
+    "Metric": ["Base Reimbursement (excl. Surcharge/GST)"],
+    "Extracted from Grid": [f"${base_grid_reimbursements:.2f}"],
+    "Receipt Invoice": [f"${ai_raw_receipts:.2f}"],
+    "Status": [tp_match_status]
+}
+
+st.write("**Reimbursement Match:**")
+st.table(pd.DataFrame(tp_data).set_index("Metric"))
