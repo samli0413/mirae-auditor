@@ -11,7 +11,7 @@ st.subheader("⚙️ Audit Settings")
 client_state = st.radio("Select Client State (for Public Holiday logic):", ["NSW", "VIC"], horizontal=True)
 st.markdown("---")
 
-# 1. THE FULL JSON DATA (Still hardcoded for this UI test)
+# 1. THE FULL JSON DATA
 raw_json = """
 {
 "summary_rows": [
@@ -84,6 +84,16 @@ def get_expected_rate(service, day_type):
         return rates.get(day_type, 78.0)
     return None 
 
+# --- 🎨 STYLING FUNCTION ---
+def style_day_type(val):
+    if val == 'Public Hol':
+        return 'background-color: #ffcccc; color: #990000; font-weight: bold;'
+    elif val == 'Sunday':
+        return 'background-color: #ffe6cc; color: #cc6600; font-weight: bold;'
+    elif val == 'Saturday':
+        return 'background-color: #ffffcc; color: #999900; font-weight: bold;'
+    return ''
+
 # --- ⚙️ PROCESSING THE DATAFRAME ---
 # Split data into Care Services vs Third Party
 df_third_party = df[df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT', case=False, na=False)].copy()
@@ -96,7 +106,7 @@ df_care["Expected Rate"] = df_care.apply(lambda row: get_expected_rate(row["serv
 # Check for Matches
 df_care["Rate Match"] = df_care.apply(lambda row: "✅ Yes" if abs(row["price"] - row["Expected Rate"]) <= 0.05 else "❌ No", axis=1)
 
-# Format the Display Table (Swapped columns, removed Math OK, renamed columns)
+# Format the Display Table
 display_care_df = df_care[["date", "service", "Day Type", "Expected Rate", "price", "Rate Match", "qty", "subtotal"]]
 display_care_df = display_care_df.rename(columns={
     "date": "Service Date", 
@@ -106,10 +116,12 @@ display_care_df = display_care_df.rename(columns={
     "subtotal": "Subtotal"
 })
 
+# Apply pandas styling to the "Day Type" column!
+styled_care_df = display_care_df.style.map(style_day_type, subset=['Day Type'])
+
 
 # --- 🖥️ UI LAYOUT ---
 
-# CHANGE 1 & 2: Main header has no sequence number, and table uses Metric as the index to hide the row numbers
 st.header("📊 Main Invoice Totals Check")
 calc_item_total = df["subtotal"].sum()
 calc_gst = 418.04 
@@ -125,17 +137,15 @@ totals_data = {
         "✅ Match" if abs(data['invoice_totals']['total_due'] - calc_grand) <= 0.05 else "❌ Mismatch"
     ]
 }
-# Setting the index to "Metric" removes the 0, 1, 2 sequence column
 st.table(pd.DataFrame(totals_data).set_index("Metric"))
 st.markdown("---")
 
-# CHANGE 2 & 3: Renamed header to "1." and updated the table format with hide_index=True
 st.header("🗓️ 1. Care Services & Rate Audit")
 st.write("Cross-checking dates, states, and weekend/holiday penalty rates.")
-st.dataframe(display_care_df, use_container_width=True, height=500, hide_index=True)
+# Render the styled dataframe
+st.dataframe(styled_care_df, use_container_width=True, height=500, hide_index=True)
 st.markdown("---")
 
-# CHANGE 2 & 4: Renamed header to "2." and simplified the side panel text
 st.header("💊 2. Third-Party & Reimbursements")
 col1, col2 = st.columns([2, 1])
 
@@ -145,6 +155,17 @@ with col1:
     st.dataframe(df_third_party[["Service Date", "Service", "Subtotal"]], use_container_width=True, hide_index=True)
 
 with col2:
-    st.write("**Third-Party Check:**")
+    st.write("**Third-Party Math Check:**")
     ai_raw_receipts = sum(data["third_party_totals"])
-    st.info(f"**Isolated Receipts Found:**\n\n${ai_raw_receipts:.2f}")
+    line_items_sum = df_third_party["Subtotal"].sum()
+    
+    st.metric(label="Isolated Receipts Found", value=f"${ai_raw_receipts:.2f}")
+    st.metric(label="Grid Line Items Total", value=f"${line_items_sum:.2f}")
+    
+    st.write("---")
+    # NEW: explicit match statement!
+    if abs(line_items_sum - ai_raw_receipts) <= 0.05:
+        st.success("✅ **Match:** The grid items equal the base receipts.")
+    else:
+        variance = line_items_sum - ai_raw_receipts
+        st.warning(f"⚠️ **Mismatch:** There is a variance of **${variance:.2f}**. (Vendor likely added a surcharge or split the receipt).")
