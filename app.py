@@ -11,7 +11,7 @@ st.subheader("⚙️ Audit Settings")
 client_state = st.radio("Select Client State (for Public Holiday logic):", ["NSW", "VIC"], horizontal=True)
 st.markdown("---")
 
-# 1. THE V3 MOCK JSON DATA (Simulating edge cases and errors)
+# 1. THE V3 MOCK JSON DATA
 raw_json = """
 {
   "summary_rows": [
@@ -64,28 +64,44 @@ def get_expected_rate(service, day_type):
     return None 
 
 def style_day_type(val):
-    if val == 'Public Hol': return 'background-color: #ffcccc; color: #990000; font-weight: bold;'
-    elif val == 'Sunday': return 'background-color: #ffe6cc; color: #cc6600; font-weight: bold;'
-    elif val == 'Saturday': return 'background-color: #ffffcc; color: #999900; font-weight: bold;'
+    if val == 'Public Hol': return 'background-color: #ffcccc; color: #990000;'
+    elif val == 'Sunday': return 'background-color: #ffe6cc; color: #cc6600;'
+    elif val == 'Saturday': return 'background-color: #ffffcc; color: #999900;'
     return ''
 
-# --- ⚙️ PROCESSING DATA ---
-df_third_party = df[df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT|UBER', case=False, na=False)].copy()
+def style_variance(val):
+    if val > 0: return 'background-color: #ffcccc; color: #990000; font-weight: bold;'
+    elif val < 0: return 'background-color: #ffffcc; color: #999900; font-weight: bold;'
+    return 'color: green;'
+
+# --- ⚙️ PROCESSING CARE DATA & TIMESHEETS ---
 df_care = df[~df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT|UBER', case=False, na=False)].copy()
 
+# 1. Apply Rates
 df_care["Day Type"] = df_care["date"].apply(get_day_type)
 df_care["Expected Rate"] = df_care.apply(lambda row: get_expected_rate(row["service"], row["Day Type"]), axis=1)
 df_care["Rate Match"] = df_care.apply(lambda row: "✅ Yes" if abs(row["price"] - row["Expected Rate"]) <= 0.05 else "❌ No", axis=1)
 
-display_care_df = df_care[["date", "service", "Day Type", "Expected Rate", "price", "Rate Match", "qty", "subtotal"]]
-display_care_df = display_care_df.rename(columns={"date": "Service Date", "service": "Service", "price": "Extracted Rate", "qty": "Qty", "subtotal": "Subtotal"})
-styled_care_df = display_care_df.style.map(style_day_type, subset=['Day Type'])
+# 2. Aggregate Daily Billed & Timesheets
+daily_billed = df_care.groupby("date")["qty"].sum().reset_index().rename(columns={"date": "Service Date", "qty": "Day Billed Total"})
+timesheet_df = pd.DataFrame(data["timesheet_hours"])
+logged_grouped = timesheet_df.groupby("date")["hours"].sum().reset_index().rename(columns={"date": "Service Date", "hours": "Day Logged Total"})
+
+# 3. Merge Daily Totals back into the main Care grid
+df_care = df_care.rename(columns={"date": "Service Date", "service": "Service", "price": "Extracted Rate", "qty": "Line Qty", "subtotal": "Subtotal"})
+df_care = df_care.merge(daily_billed, on="Service Date", how="left")
+df_care = df_care.merge(logged_grouped, on="Service Date", how="left").fillna(0)
+df_care["Day Variance"] = df_care["Day Billed Total"] - df_care["Day Logged Total"]
+
+# Format display columns
+display_care_df = df_care[["Service Date", "Day Type", "Service", "Expected Rate", "Extracted Rate", "Rate Match", "Line Qty", "Day Billed Total", "Day Logged Total", "Day Variance"]]
+styled_care_df = display_care_df.style.map(style_day_type, subset=['Day Type']).map(style_variance, subset=['Day Variance'])
 
 
 # --- 🖥️ UI LAYOUT ---
 st.header("📊 1. Main Invoice Totals Check")
 calc_item_total = df["subtotal"].sum()
-calc_gst = 32.20 # Mocked for this example
+calc_gst = 32.20 # Mocked
 calc_grand = calc_item_total + calc_gst
 
 totals_data = {
@@ -101,68 +117,38 @@ totals_data = {
 st.table(pd.DataFrame(totals_data).set_index("Metric"))
 st.markdown("---")
 
-st.header("🗓️ 2. Care Services & Rate Audit")
+st.header("🗓️ 2. Care Services & Timesheet Audit")
+st.write("Cross-checking rates and ensuring the **Daily Billed Total** matches the **Daily Logged Total** from the timesheets.")
 st.dataframe(styled_care_df, use_container_width=True, hide_index=True)
 st.markdown("---")
 
-# --- ⏱️ THE NEW TIMESHEET MATRIX ---
-st.header("⏱️ 3. Timesheet Reconciliation")
-st.write("Cross-checking the billed quantities from the grid against the physical timesheet logs.")
+# --- 💊 3. THE SMART THIRD-PARTY MATRIX ---
+st.header("💊 3. Third-Party Receipts & Surcharges")
 
-# 1. Aggregate Billed Hours
-billed_grouped = df_care.groupby("date")["qty"].sum().reset_index().rename(columns={"date": "Service Date", "qty": "Billed Qty"})
+# A. Process Receipts & auto-calculate 10%
+receipts_df = pd.DataFrame(data["third_party_totals"])
+receipts_df["Expected Surcharge"] = receipts_df["amount"] * 0.10
+total_receipt_base = receipts_df["amount"].sum()
+total_expected_surcharge = receipts_df["Expected Surcharge"].sum()
 
-# 2. Aggregate Logged Hours (from the new List format)
-timesheet_df = pd.DataFrame(data["timesheet_hours"])
-logged_grouped = timesheet_df.groupby("date")["hours"].sum().reset_index().rename(columns={"date": "Service Date", "hours": "Logged Hours"})
+st.write("**A. Evidence Provided (Physical Receipts):**")
+receipts_display = receipts_df.rename(columns={"date": "Date", "vendor": "Vendor", "amount": "Receipt Base Amount"})
+st.dataframe(receipts_display, use_container_width=True, hide_index=True)
 
-# 3. Merge & Compare
-recon_df = pd.merge(billed_grouped, logged_grouped, on="Service Date", how="outer").fillna(0)
-recon_df["Variance"] = recon_df["Billed Qty"] - recon_df["Logged Hours"]
+# B. Process the Grid Claims
+df_third_party = df[df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT|UBER', case=False, na=False)].copy()
+grid_base_claimed = df_third_party[~df_third_party['service'].str.contains('SURCHARGE', case=False, na=False)]['subtotal'].sum()
+grid_surcharge_claimed = df_third_party[df_third_party['service'].str.contains('SURCHARGE', case=False, na=False)]['subtotal'].sum()
 
-def get_timesheet_status(variance):
-    if variance > 0: return "🚨 Overbilled"
-    elif variance < 0: return "⚠️ Underbilled"
-    return "✅ Match"
-
-recon_df["Status"] = recon_df["Variance"].apply(get_timesheet_status)
-
-def style_variance(val):
-    if val > 0: return 'background-color: #ffcccc; color: #990000; font-weight: bold;'
-    elif val < 0: return 'background-color: #ffffcc; color: #999900; font-weight: bold;'
-    return 'color: green;'
-
-styled_recon = recon_df.style.map(style_variance, subset=['Variance'])
-st.dataframe(styled_recon, use_container_width=True, hide_index=True)
-st.markdown("---")
-
-# --- 💊 THE NEW THIRD-PARTY MATRIX ---
-st.header("💊 4. Third-Party & Reimbursements")
-col1, col2 = st.columns(2)
-
-with col1:
-    st.write("**A. Claimed in Main Grid (Excl. Surcharge):**")
-    base_grid_df = df_third_party[~df_third_party['service'].str.contains('SURCHARGE', case=False, na=False)]
-    base_grid_df = base_grid_df.rename(columns={"date": "Date", "service": "Service", "subtotal": "Amount claimed"})
-    st.dataframe(base_grid_df[["Date", "Service", "Amount claimed"]], use_container_width=True, hide_index=True)
-
-with col2:
-    st.write("**B. Physical Receipts Found:**")
-    receipts_df = pd.DataFrame(data["third_party_totals"])
-    receipts_df = receipts_df.rename(columns={"date": "Date", "vendor": "Vendor", "amount": "Receipt Total"})
-    st.dataframe(receipts_df, use_container_width=True, hide_index=True)
-
-st.write("**Reimbursement Match:**")
-grid_total = base_grid_df["Amount claimed"].sum()
-receipts_total = receipts_df["Receipt Total"].sum()
-tp_match_status = "✅ Match" if abs(grid_total - receipts_total) <= 0.05 else "❌ Mismatch"
+st.write("**B. Surcharge & Reimbursement Cross-Check:**")
 
 tp_data = {
-    "Metric": ["Totals"],
-    "Grid Claims": [f"${grid_total:.2f}"],
-    "Receipt Proof": [f"${receipts_total:.2f}"],
-    "Status": [tp_match_status]
+    "Metric": ["Base Reimbursements", "10% Surcharges"],
+    "Expected (From Receipts)": [f"${total_receipt_base:.2f}", f"${total_expected_surcharge:.2f}"],
+    "Actually Billed (In Grid)": [f"${grid_base_claimed:.2f}", f"${grid_surcharge_claimed:.2f}"],
+    "Status": [
+        "✅ Match" if abs(total_receipt_base - grid_base_claimed) <= 0.05 else f"❌ Mismatch (Diff: ${(grid_base_claimed - total_receipt_base):.2f})",
+        "✅ Match" if abs(total_expected_surcharge - grid_surcharge_claimed) <= 0.05 else f"❌ Mismatch (Diff: ${(grid_surcharge_claimed - total_expected_surcharge):.2f})"
+    ]
 }
 st.table(pd.DataFrame(tp_data).set_index("Metric"))
-if abs(grid_total - receipts_total) > 0.05:
-    st.error(f"⚠️ **Variance Detected:** The vendor claimed **${grid_total:.2f}** in the grid, but the physical receipts only add up to **${receipts_total:.2f}**. Please check the Uber line item.")
