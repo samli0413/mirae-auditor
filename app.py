@@ -11,7 +11,7 @@ st.subheader("⚙️ Audit Settings")
 client_state = st.radio("Select Client State (for Public Holiday logic):", ["NSW", "VIC"], horizontal=True)
 st.markdown("---")
 
-# 1. THE FULL JSON DATA
+# 1. THE FULL JSON DATA (Still hardcoded for this UI test)
 raw_json = """
 {
 "summary_rows": [
@@ -62,14 +62,11 @@ data = json.loads(raw_json)
 df = pd.DataFrame(data["summary_rows"])
 
 # --- 🗓️ DYNAMIC HOLIDAY LOGIC ---
-# Load the correct holidays for the selected state and the year 2026
 state_holidays = holidays.AU(subdiv=client_state, years=2026)
 
 def get_day_type(date_str):
     dt = pd.to_datetime(date_str, format="%d/%m/%Y")
-    
     if dt in state_holidays:
-        # e.g., Jan 26 is Australia Day, so it will trigger here
         return "Public Hol"
     if dt.weekday() == 5: 
         return "Saturday"
@@ -98,15 +95,22 @@ df_care["Expected Rate"] = df_care.apply(lambda row: get_expected_rate(row["serv
 
 # Check for Matches
 df_care["Rate Match"] = df_care.apply(lambda row: "✅ Yes" if abs(row["price"] - row["Expected Rate"]) <= 0.05 else "❌ No", axis=1)
-df_care["Math OK"] = df_care.apply(lambda row: "✅" if abs((row["price"] * row["qty"]) - row["subtotal"]) <= 0.05 else "❌", axis=1)
 
-# Format the Display Table (Renamed 'date' to 'Service Date' for clarity)
-display_care_df = df_care[["date", "Day Type", "service", "Expected Rate", "price", "Rate Match", "qty", "subtotal", "Math OK"]]
-display_care_df = display_care_df.rename(columns={"date": "Service Date", "price": "Extracted Rate"})
+# Format the Display Table (Swapped columns, removed Math OK, renamed columns)
+display_care_df = df_care[["date", "service", "Day Type", "Expected Rate", "price", "Rate Match", "qty", "subtotal"]]
+display_care_df = display_care_df.rename(columns={
+    "date": "Service Date", 
+    "service": "Service",
+    "price": "Extracted Rate",
+    "qty": "Qty",
+    "subtotal": "Subtotal"
+})
 
 
 # --- 🖥️ UI LAYOUT ---
-st.header("📊 1. Main Invoice Totals Check")
+
+# CHANGE 1 & 2: Main header has no sequence number, and table uses Metric as the index to hide the row numbers
+st.header("📊 Main Invoice Totals Check")
 calc_item_total = df["subtotal"].sum()
 calc_gst = 418.04 
 calc_grand = calc_item_total + calc_gst
@@ -121,28 +125,26 @@ totals_data = {
         "✅ Match" if abs(data['invoice_totals']['total_due'] - calc_grand) <= 0.05 else "❌ Mismatch"
     ]
 }
-st.table(pd.DataFrame(totals_data))
+# Setting the index to "Metric" removes the 0, 1, 2 sequence column
+st.table(pd.DataFrame(totals_data).set_index("Metric"))
 st.markdown("---")
 
-st.header("🗓️ 2. Care Services & Rate Audit")
+# CHANGE 2 & 3: Renamed header to "1." and updated the table format with hide_index=True
+st.header("🗓️ 1. Care Services & Rate Audit")
 st.write("Cross-checking dates, states, and weekend/holiday penalty rates.")
-# Using st.dataframe allows your wife to sort by any of these columns instantly!
-st.dataframe(display_care_df, use_container_width=True, height=500)
+st.dataframe(display_care_df, use_container_width=True, height=500, hide_index=True)
 st.markdown("---")
 
-st.header("💊 3. Third-Party & Reimbursements")
+# CHANGE 2 & 4: Renamed header to "2." and simplified the side panel text
+st.header("💊 2. Third-Party & Reimbursements")
 col1, col2 = st.columns([2, 1])
 
 with col1:
     st.write("**Extracted Third-Party Line Items:**")
-    df_third_party = df_third_party.rename(columns={"date": "Service Date", "price": "Rate", "qty": "Qty", "subtotal": "Subtotal"})
-    st.dataframe(df_third_party[["Service Date", "service", "Subtotal"]], use_container_width=True)
+    df_third_party = df_third_party.rename(columns={"date": "Service Date", "service": "Service", "price": "Rate", "qty": "Qty", "subtotal": "Subtotal"})
+    st.dataframe(df_third_party[["Service Date", "Service", "Subtotal"]], use_container_width=True, hide_index=True)
 
 with col2:
-    st.write("**Third-Party Math Check:**")
+    st.write("**Third-Party Check:**")
     ai_raw_receipts = sum(data["third_party_totals"])
-    line_items_sum = df_third_party["Subtotal"].sum()
-    
-    st.info(f"**Base Receipts Found:** ${ai_raw_receipts:.2f}\n\n**Total Billed (with surcharges):** ${line_items_sum:.2f}")
-    if line_items_sum > ai_raw_receipts:
-        st.warning(f"Note: Vendor billed **${(line_items_sum - ai_raw_receipts):.2f}** more in the grid than the base receipts. Please verify this surcharge is valid.")
+    st.info(f"**Isolated Receipts Found:**\n\n${ai_raw_receipts:.2f}")
