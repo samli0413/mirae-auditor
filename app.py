@@ -102,16 +102,6 @@ if uploaded_file and api_key:
                 except:
                     return "Unknown"
 
-            def get_expected_rate(service, day_type):
-                service = str(service).upper()
-                if "PERSONAL CARE" in service:
-                    rates = {"Standard": 83.0, "Saturday": 116.2, "Sunday": 146.54, "Public Hol": 182.6}
-                    return rates.get(day_type, 83.0)
-                elif "MEALS" in service or "RESPITE" in service:
-                    rates = {"Standard": 78.0, "Saturday": 109.2, "Sunday": 146.54, "Public Hol": 171.6}
-                    return rates.get(day_type, 78.0)
-                return None 
-
             def style_day_type(val):
                 if val == 'Public Hol': return 'background-color: #ffcccc; color: #990000;'
                 elif val == 'Sunday': return 'background-color: #ffe6cc; color: #cc6600;'
@@ -123,7 +113,59 @@ if uploaded_file and api_key:
                 if val > 0: return 'background-color: #ffcccc; color: #990000; font-weight: bold;'
                 elif val < 0: return 'background-color: #ffffcc; color: #999900; font-weight: bold;'
                 return 'color: green;'
+                
+            # --- ⚙️ LIVE MASTER RATE MAPPING (CSV DATABASE) ---
+            st.markdown("---")
+            st.subheader("📖 Master Rate Dictionary")
+            st.write("Add new vendor keywords or update rates here. Changes are saved permanently.")
+            
+            RATE_FILE = "master_rates.csv"
 
+            # 1. If the CSV doesn't exist yet, create it with the default pre-populated data
+            if not os.path.exists(RATE_FILE):
+                initial_data = {
+                    "Keywords (Comma Separated)": [
+                        "MANAGEMENT, CARE MGT",
+                        "SOCIAL, SUPPORT",
+                        "PERSONAL, PC",
+                        "DOMESTIC, CLEANING, LAUNDRY, RESPITE, MEAL",
+                        "TRANSPORT, TRIP, TRAVEL, KM"
+                    ],
+                    "Standard": [120.00, 86.20, 83.00, 78.00, 70.00],
+                    "Saturday": [168.00, 120.68, 116.20, 109.20, 98.00],
+                    "Sunday": [204.00, 146.54, 141.10, 132.60, 119.00],
+                    "Public Hol": [264.00, 189.64, 182.60, 171.60, 154.00]
+                }
+                pd.DataFrame(initial_data).to_csv(RATE_FILE, index=False)
+
+            # 2. Load the current rates from the CSV file
+            rate_mapping_df = pd.read_csv(RATE_FILE)
+
+            # 3. Render the editable data grid
+            edited_rates_df = st.data_editor(
+                rate_mapping_df, 
+                num_rows="dynamic", # Allows adding/deleting rows
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # 4. Save changes back to the CSV instantly if your wife edits the table
+            if not edited_rates_df.equals(rate_mapping_df):
+                edited_rates_df.to_csv(RATE_FILE, index=False)
+                st.toast("💾 Master rates saved permanently!", icon="✅")
+
+            # 5. The dynamic checking function (using the live edited data)
+            def get_expected_rate(service, day_type):
+                service = str(service).upper()
+                for index, row in edited_rates_df.iterrows():
+                    keywords = [k.strip().upper() for k in str(row["Keywords (Comma Separated)"]).split(",")]
+                    if any(k in service for k in keywords if k): 
+                        if day_type == "Saturday": return float(row["Saturday"])
+                        elif day_type == "Sunday": return float(row["Sunday"])
+                        elif day_type == "Public Hol": return float(row["Public Hol"])
+                        else: return float(row["Standard"])
+                return None
+                
             df = pd.DataFrame(data.get("summary_rows", []))
             
             if not df.empty:
