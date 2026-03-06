@@ -312,7 +312,9 @@ if uploaded_file and api_key:
         
         if tp_data_list or not df_tp.empty:
             if not receipts_df.empty:
-                receipts_df = receipts_df.rename(columns={"date": "Date", "vendor": "Receipt Vendor", "amount": "Calculated Base"})
+                # FIX: We only rename Date and Vendor here. 
+                # "Calculated Base" already exists perfectly from the math we did earlier!
+                receipts_df = receipts_df.rename(columns={"date": "Date", "vendor": "Receipt Vendor"})
             else:
                 receipts_df = pd.DataFrame(columns=["Date", "Receipt Vendor", "Calculated Base", "Calculated Surcharge"])
 
@@ -322,8 +324,9 @@ if uploaded_file and api_key:
 
             tp_recon = receipts_df.merge(ext_base, on="Date", how="outer").merge(ext_sur, on="Date", how="outer").fillna(0)
 
-            tp_recon["Base Match"] = tp_recon.apply(lambda r: "✅" if abs(r["Extracted Base (Summary)"] - r.get("Calculated Base", 0)) <= 0.05 else f"❌ Mismatch (+${(r['Extracted Base (Summary)'] - r.get('Calculated Base', 0)):.2f})", axis=1)
-            tp_recon["Surcharge Match"] = tp_recon.apply(lambda r: "✅" if abs(r["Extracted Surcharge (Summary)"] - r.get("Calculated Surcharge", 0)) <= 0.05 else f"❌ Mismatch (+${(r['Extracted Surcharge (Summary)'] - r.get('Calculated Surcharge', 0)):.2f})", axis=1)
+            # Safely using .get() to prevent any missing column errors
+            tp_recon["Base Match"] = tp_recon.apply(lambda r: "✅" if abs(r.get("Extracted Base (Summary)", 0) - r.get("Calculated Base", 0)) <= 0.05 else f"❌ Mismatch (+${(r.get('Extracted Base (Summary)', 0) - r.get('Calculated Base', 0)):.2f})", axis=1)
+            tp_recon["Surcharge Match"] = tp_recon.apply(lambda r: "✅" if abs(r.get("Extracted Surcharge (Summary)", 0) - r.get("Calculated Surcharge", 0)) <= 0.05 else f"❌ Mismatch (+${(r.get('Extracted Surcharge (Summary)', 0) - r.get('Calculated Surcharge', 0)):.2f})", axis=1)
 
             display_tp = tp_recon[["Date", "Receipt Vendor", "Calculated Base", "Extracted Base (Summary)", "Base Match", "Calculated Surcharge", "Extracted Surcharge (Summary)", "Surcharge Match"]]
             st.dataframe(display_tp, use_container_width=True, hide_index=True)
