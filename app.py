@@ -59,7 +59,7 @@ List of objects with:
 if uploaded_file and api_key:
     genai.configure(api_key=api_key)
     
-    # --- 🧠 PREVENT AI RE-RUNS (THE SPEED FIX) ---
+    # --- 🧠 PREVENT AI RE-RUNS ---
     if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -75,7 +75,7 @@ if uploaded_file and api_key:
                 )
                 response = model.generate_content([gemini_file, SYSTEM_PROMPT])
                 
-                # Save the AI data and file name to memory
+                # Save data to memory
                 st.session_state.extracted_data = json.loads(response.text)
                 st.session_state.current_file = uploaded_file.name
                 
@@ -87,10 +87,9 @@ if uploaded_file and api_key:
                 st.error(f"An error occurred during AI processing: {e}")
                 st.stop()
 
-    # Load data from memory so the app is instantly responsive
     data = st.session_state.extracted_data
 
-    # --- 🗓️ DYNAMIC HOLIDAY LOGIC (Auto-Detected State) ---
+    # --- 🗓️ DYNAMIC HOLIDAY LOGIC ---
     client_state = data.get("client_state", "NSW").upper()
     valid_states = ["NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"]
     if client_state not in valid_states:
@@ -111,7 +110,7 @@ if uploaded_file and api_key:
     # --- ⚙️ LIVE MASTER RATE MAPPING (CSV DATABASE) ---
     st.markdown("---")
     st.subheader("📖 Master Rate Dictionary")
-    st.write("Add new vendor keywords or update rates here. Changes are saved permanently.")
+    st.write("Add new vendor keywords or update rates here. **To delete a row:** click the grey box on the far left of the row, then press Delete on your keyboard.")
     
     RATE_FILE = "master_rates.csv"
 
@@ -133,16 +132,17 @@ if uploaded_file and api_key:
 
     rate_mapping_df = pd.read_csv(RATE_FILE)
 
+    # Added key="master_rate_editor" to fix the double-entry bug!
     edited_rates_df = st.data_editor(
         rate_mapping_df, 
         num_rows="dynamic",
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        key="master_rate_editor" 
     )
 
     if not edited_rates_df.equals(rate_mapping_df):
         edited_rates_df.to_csv(RATE_FILE, index=False)
-        st.toast("💾 Master rates saved permanently!", icon="✅")
 
     def get_expected_rate(service, day_type):
         service = str(service).upper()
@@ -180,7 +180,6 @@ if uploaded_file and api_key:
         df_care["Day Type"] = df_care["date"].apply(get_day_type)
         df_care["Calculated Rate"] = df_care.apply(lambda row: get_expected_rate(row["service"], row["Day Type"]), axis=1)
         
-        # Care Source of Truth Math
         df_care["Calculated Subtotal (Truth)"] = df_care["Calculated Rate"] * df_care["qty"]
         
         df_care["Rate Match"] = df_care.apply(lambda row: "✅" if pd.notna(row["Calculated Rate"]) and abs(row["price"] - row["Calculated Rate"]) <= 0.05 else "❌", axis=1)
@@ -196,7 +195,6 @@ if uploaded_file and api_key:
         })
         styled_care_df = display_care_df.style.map(style_day_type, subset=['Day Type'])
 
-        # --- ⚙️ PROCESSING THIRD-PARTY TRUTH DATA ---
         tp_data_list = data.get("third_party_totals", [])
         receipts_df = pd.DataFrame(tp_data_list)
         true_tp_base = 0.0
@@ -208,32 +206,36 @@ if uploaded_file and api_key:
             true_tp_base = receipts_df["Calculated Base"].sum()
             true_tp_surcharge = receipts_df["Calculated Surcharge"].sum()
 
-        # --- 🖥️ UI LAYOUT ---
-
         # ---------------------------------------------------------
         # SECTION 1: FORENSIC TOTALS
         # ---------------------------------------------------------
         st.header("📊 1. Forensic Invoice Totals (Source of Truth)")
-        st.write("This table reconstructs the entire invoice using ONLY your master rate mapping and physical receipt evidence.")
+        st.write("This table reconstructs the entire invoice using ONLY your master rate mapping, physical receipt evidence, and strict 10% GST.")
         
         inv_totals = data.get("invoice_totals", {})
         ext_item_total = inv_totals.get("item_total", 0.0)
         ext_gst = inv_totals.get("gst", 0.0)
         ext_grand = inv_totals.get("total_due", 0.0)
         
+        # 1. Calculate the Pure Truth Base Total
         true_care_total = df_care["Calculated Subtotal (Truth)"].sum(skipna=True)
         true_item_total = true_care_total + true_tp_base + true_tp_surcharge
-        true_grand_total = true_item_total + ext_gst 
+        
+        # 2. Strict 10% GST applied to the True Total
+        true_gst = true_item_total * 0.10
+        
+        # 3. Calculate the Pure Truth Grand Total
+        true_grand_total = true_item_total + true_gst 
         
         variance = ext_grand - true_grand_total
 
         totals_data = {
             "Metric": ["Item Total", "GST", "Grand Total"],
             "Vendor Claimed (Invoice)": [f"${ext_item_total:.2f}", f"${ext_gst:.2f}", f"${ext_grand:.2f}"],
-            "Audited Truth (Master Rates & Receipts)": [f"${true_item_total:.2f}", f"${ext_gst:.2f}", f"${true_grand_total:.2f}"],
+            "Audited Truth (Master Rates & Receipts)": [f"${true_item_total:.2f}", f"${true_gst:.2f}", f"${true_grand_total:.2f}"],
             "Status": [
-                "✅ Match" if abs(ext_item_total - true_item_total) <= 0.05 else f"❌ Mismatch",
-                "✅ Match",
+                "✅ Match" if abs(ext_item_total - true_item_total) <= 0.05 else "❌ Mismatch",
+                "✅ Match" if abs(ext_gst - true_gst) <= 0.05 else "❌ Mismatch",
                 "✅ Match" if abs(ext_grand - true_grand_total) <= 0.05 else f"🚨 OVERCHARGED by ${variance:.2f}" if variance > 0.05 else f"⚠️ UNDERCHARGED by ${abs(variance):.2f}"
             ]
         }
@@ -249,16 +251,33 @@ if uploaded_file and api_key:
         st.markdown("---")
 
         # ---------------------------------------------------------
-        # SECTION 3: TIMESHEET RECONCILIATION
+        # SECTION 3: TIMESHEET RECONCILIATION (NOW EDITABLE)
         # ---------------------------------------------------------
         st.header("⏱️ 3. Timesheet Reconciliation")
-        st.write("Cross-checking the total hours extracted from the summary page against the physical timesheet logs.")
+        st.write("If the AI misread messy handwriting, **you can edit or delete rows directly in the timesheet data below** to correct it!")
 
-        timesheet_data = data.get("timesheet_hours", [])
-        if timesheet_data:
+        # Initialize timesheet data in session state so edits stick
+        if "timesheet_df" not in st.session_state or st.session_state.get("ts_file") != uploaded_file.name:
+            st.session_state.timesheet_df = pd.DataFrame(data.get("timesheet_hours", []))
+            st.session_state.ts_file = uploaded_file.name
+
+        if not st.session_state.timesheet_df.empty:
+            
+            # The editable AI extracted data
+            edited_ts_df = st.data_editor(
+                st.session_state.timesheet_df, 
+                num_rows="dynamic", 
+                use_container_width=True, 
+                hide_index=True,
+                key="timesheet_editor"
+            )
+            
+            # Save the edits to memory
+            st.session_state.timesheet_df = edited_ts_df
+
+            # Do the math using the EDITED dataframe
             daily_extracted = df_care.groupby("date")["qty"].sum().reset_index().rename(columns={"date": "Date", "qty": "Extracted Hours (Summary)"})
-            timesheet_df = pd.DataFrame(timesheet_data)
-            daily_calculated = timesheet_df.groupby("date")["hours"].sum().reset_index().rename(columns={"date": "Date", "hours": "Calculated Hours (Timesheet)"})
+            daily_calculated = edited_ts_df.groupby("date")["hours"].sum().reset_index().rename(columns={"date": "Date", "hours": "Calculated Hours (Timesheet)"})
 
             recon_df = pd.merge(daily_extracted, daily_calculated, on="Date", how="outer").fillna(0)
             recon_df["Variance"] = recon_df["Extracted Hours (Summary)"] - recon_df["Calculated Hours (Timesheet)"]
@@ -270,6 +289,8 @@ if uploaded_file and api_key:
 
             recon_df["Status"] = recon_df["Variance"].apply(get_timesheet_status)
             styled_recon = recon_df.style.map(style_variance, subset=['Variance'])
+            
+            st.subheader("Final Match Result")
             st.dataframe(styled_recon, use_container_width=True, hide_index=True)
         else:
             st.info("No timesheet hours were found in this document.")
@@ -286,7 +307,6 @@ if uploaded_file and api_key:
         if tp_data_list or not df_tp.empty:
             if not receipts_df.empty:
                 receipts_df = receipts_df.rename(columns={"date": "Date", "vendor": "Receipt Vendor", "amount": "Calculated Base"})
-                # Calculated Base and Surcharge already added above for Section 1 math
             else:
                 receipts_df = pd.DataFrame(columns=["Date", "Receipt Vendor", "Calculated Base", "Calculated Surcharge"])
 
