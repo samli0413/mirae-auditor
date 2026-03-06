@@ -46,7 +46,9 @@ Extract the data and return ONLY a valid JSON object matching this exact structu
 - "worker" (string, name or ID of the carer)
 - "hours" (float, total hours logged for that shift)
 
-3. "third_party_totals": Physical third-party receipts/reimbursements attached (e.g., Pharmacy, Uber). List of objects with:
+3. "third_party_totals": Physical third-party receipts/reimbursements attached (e.g., Pharmacy, Uber). 
+CRITICAL RULE: DO NOT extract handwritten dollar amounts or notes found on the timesheets. ONLY extract totals from official, separate printed vendor receipts.
+List of objects with:
 - "date" (format DD/MM/YYYY of the receipt)
 - "vendor" (string, name of the store/service)
 - "amount" (float, the base amount of the receipt, exactly as printed)
@@ -79,7 +81,7 @@ if uploaded_file and api_key:
             os.remove(tmp_file_path)
             genai.delete_file(gemini_file.name)
             
-            st.success("✅ Extraction Complete! Rendering Dashboard...")
+            st.toast("Extraction Complete! Rendering Dashboard...", icon="✅")
 
             # --- 🗓️ DYNAMIC HOLIDAY LOGIC ---
             state_holidays = holidays.AU(subdiv=client_state, years=2026)
