@@ -11,7 +11,7 @@ st.subheader("⚙️ Audit Settings")
 client_state = st.radio("Select Client State (for Public Holiday logic):", ["NSW", "VIC"], horizontal=True)
 st.markdown("---")
 
-# 1. THE V3 MOCK JSON DATA
+# 1. THE V3 MOCK JSON DATA (Updated with itemized surcharges!)
 raw_json = """
 {
   "summary_rows": [
@@ -20,8 +20,9 @@ raw_json = """
     {"date": "27/01/2026", "service": "PERSONAL CARE", "price": 83.0, "qty": 2.0, "subtotal": 166.0},
     {"date": "28/01/2026", "service": "RESPITE", "price": 78.0, "qty": 2.0, "subtotal": 156.0},
     {"date": "01/02/2026", "service": "PHARMACY REIMBURSEMENT", "price": 486.95, "qty": 1.0, "subtotal": 486.95},
+    {"date": "01/02/2026", "service": "INVOICE SURCHARGE 10%", "price": 48.69, "qty": 1.0, "subtotal": 48.69},
     {"date": "02/02/2026", "service": "UBER TRANSPORT", "price": 50.00, "qty": 1.0, "subtotal": 50.00},
-    {"date": "01/02/2026", "service": "INVOICE SURCHARGE 10%", "price": 48.69, "qty": 1.0, "subtotal": 48.69}
+    {"date": "02/02/2026", "service": "UBER SURCHARGE 10%", "price": 5.00, "qty": 1.0, "subtotal": 5.00}
   ],
   "timesheet_hours": [
     {"date": "26/01/2026", "worker": "Alice", "hours": 2.0},
@@ -34,9 +35,9 @@ raw_json = """
     {"date": "02/02/2026", "vendor": "Uber Receipts", "amount": 45.00}
   ],
   "invoice_totals": {
-    "item_total": 1798.64,
+    "item_total": 1803.64,
     "gst": 32.20,
-    "total_due": 1830.84
+    "total_due": 1835.84
   }
 }
 """
@@ -129,14 +130,10 @@ st.markdown("---")
 st.header("⏱️ 3. Timesheet Reconciliation")
 st.write("Cross-checking the total hours extracted from the summary page against the physical timesheet logs.")
 
-# Aggregate Billed Hours from Summary
 daily_extracted = df_care.groupby("date")["qty"].sum().reset_index().rename(columns={"date": "Date", "qty": "Extracted Hours (Summary)"})
-
-# Aggregate Logged Hours from Timesheets
 timesheet_df = pd.DataFrame(data["timesheet_hours"])
 daily_calculated = timesheet_df.groupby("date")["hours"].sum().reset_index().rename(columns={"date": "Date", "hours": "Calculated Hours (Timesheet)"})
 
-# Merge and compare
 recon_df = pd.merge(daily_extracted, daily_calculated, on="Date", how="outer").fillna(0)
 recon_df["Variance"] = recon_df["Extracted Hours (Summary)"] - recon_df["Calculated Hours (Timesheet)"]
 
@@ -146,42 +143,35 @@ def get_timesheet_status(variance):
     return "✅ Match"
 
 recon_df["Status"] = recon_df["Variance"].apply(get_timesheet_status)
-
 styled_recon = recon_df.style.map(style_variance, subset=['Variance'])
 st.dataframe(styled_recon, use_container_width=True, hide_index=True)
 st.markdown("---")
 
 # ---------------------------------------------------------
-# SECTION 4: THIRD-PARTY RECEIPTS
+# SECTION 4: ITEMIZED THIRD-PARTY RECEIPTS
 # ---------------------------------------------------------
-st.header("💊 4. Third-Party Receipts & Surcharges")
-st.write("Cross-checking the extracted reimbursements against the actual physical receipts provided.")
+st.header("💊 4. Itemized Third-Party Receipts & Surcharges")
+st.write("Line-by-line cross-check of extracted vendor claims vs. actual calculated receipt evidence.")
 
-col1, col2 = st.columns([1, 1])
+# A. Calculated Source of Truth (From Physical Receipts)
+receipts_df = pd.DataFrame(data["third_party_totals"]).rename(columns={"date": "Date", "vendor": "Receipt Vendor", "amount": "Calculated Base"})
+receipts_df["Calculated Surcharge"] = receipts_df["Calculated Base"] * 0.10
 
-with col1:
-    st.write("**Physical Receipt Evidence Found by AI:**")
-    receipts_df = pd.DataFrame(data["third_party_totals"])
-    st.dataframe(receipts_df.rename(columns={"date": "Date", "vendor": "Vendor", "amount": "Amount"}), use_container_width=True, hide_index=True)
+# B. Extracted Summary Page (Vendor Claims)
+df_tp = df[df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT|UBER', case=False, na=False)].copy()
+is_surcharge = df_tp['service'].str.contains('SURCHARGE', case=False, na=False)
 
-with col2:
-    st.write("**Cross-Check:**")
-    # Source 1: Extracted from Summary Grid
-    df_third_party = df[df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT|UBER', case=False, na=False)].copy()
-    extracted_base = df_third_party[~df_third_party['service'].str.contains('SURCHARGE', case=False, na=False)]['subtotal'].sum()
-    extracted_surcharge = df_third_party[df_third_party['service'].str.contains('SURCHARGE', case=False, na=False)]['subtotal'].sum()
+ext_base = df_tp[~is_surcharge].groupby('date')['subtotal'].sum().reset_index().rename(columns={"date": "Date", "subtotal": "Extracted Base (Summary)"})
+ext_sur = df_tp[is_surcharge].groupby('date')['subtotal'].sum().reset_index().rename(columns={"date": "Date", "subtotal": "Extracted Surcharge (Summary)"})
 
-    # Source 2: Calculated from Physical Receipts
-    calculated_base = receipts_df["amount"].sum()
-    calculated_surcharge = calculated_base * 0.10 # Auto-calculate the 10% 
+# C. Merge into a single Itemized Matrix based on Date
+tp_recon = receipts_df.merge(ext_base, on="Date", how="outer").merge(ext_sur, on="Date", how="outer").fillna(0)
 
-    tp_data = {
-        "Metric": ["Base Reimbursements", "10% Surcharges"],
-        "Extracted (Summary Page)": [f"${extracted_base:.2f}", f"${extracted_surcharge:.2f}"],
-        "Calculated (Source of Truth)": [f"${calculated_base:.2f}", f"${calculated_surcharge:.2f}"],
-        "Status": [
-            "✅ Match" if abs(extracted_base - calculated_base) <= 0.05 else f"❌ Mismatch",
-            "✅ Match" if abs(extracted_surcharge - calculated_surcharge) <= 0.05 else f"❌ Mismatch"
-        ]
-    }
-    st.table(pd.DataFrame(tp_data).set_index("Metric"))
+# D. Determine Variances & Status
+tp_recon["Base Match"] = tp_recon.apply(lambda r: "✅" if abs(r["Extracted Base (Summary)"] - r["Calculated Base"]) <= 0.05 else f"❌ Mismatch (+${(r['Extracted Base (Summary)'] - r['Calculated Base']):.2f})", axis=1)
+tp_recon["Surcharge Match"] = tp_recon.apply(lambda r: "✅" if abs(r["Extracted Surcharge (Summary)"] - r["Calculated Surcharge"]) <= 0.05 else f"❌ Mismatch (+${(r['Extracted Surcharge (Summary)'] - r['Calculated Surcharge']):.2f})", axis=1)
+
+# Format Final Display Table
+display_tp = tp_recon[["Date", "Receipt Vendor", "Calculated Base", "Extracted Base (Summary)", "Base Match", "Calculated Surcharge", "Extracted Surcharge (Summary)", "Surcharge Match"]]
+
+st.dataframe(display_tp, use_container_width=True, hide_index=True)
