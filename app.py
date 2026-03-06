@@ -59,26 +59,37 @@ List of objects with:
 if uploaded_file and api_key:
     genai.configure(api_key=api_key)
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_file_path = tmp_file.name
+    # --- 🧠 PREVENT AI RE-RUNS (THE SPEED FIX) ---
+    # Check if we already processed this exact file
+    if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
 
-    with st.spinner("🤖 AI is reading and extracting the invoice data..."):
-        try:
-            # 1. Upload & Process via Gemini
-            gemini_file = genai.upload_file(tmp_file_path)
-            model = genai.GenerativeModel(
-                model_name='gemini-2.5-flash',
-                generation_config={"response_mime_type": "application/json"}
-            )
-            response = model.generate_content([gemini_file, SYSTEM_PROMPT])
-            data = json.loads(response.text)
-            
-            # Clean up files
-            os.remove(tmp_file_path)
-            genai.delete_file(gemini_file.name)
-            
-            st.toast("Extraction Complete! Rendering Dashboard...", icon="✅")
+        with st.spinner("🤖 AI is reading the invoice... (This only happens once!)"):
+            try:
+                gemini_file = genai.upload_file(tmp_file_path)
+                model = genai.GenerativeModel(
+                    model_name='gemini-2.5-flash',
+                    generation_config={"response_mime_type": "application/json"}
+                )
+                response = model.generate_content([gemini_file, SYSTEM_PROMPT])
+                
+                # Save the AI data and file name to memory!
+                st.session_state.extracted_data = json.loads(response.text)
+                st.session_state.current_file = uploaded_file.name
+                
+                os.remove(tmp_file_path)
+                genai.delete_file(gemini_file.name)
+                st.toast("Extraction Complete!", icon="✅")
+                
+            except Exception as e:
+                st.error(f"An error occurred during AI processing: {e}")
+                st.stop() # Stop the app from crashing further down if the AI fails
+
+    # Load the data purely from memory so the app is instantly responsive
+    data = st.session_state.extracted_data
 
             # --- 🗓️ DYNAMIC HOLIDAY LOGIC (Auto-Detected State) ---
             client_state = data.get("client_state", "NSW").upper()
@@ -155,10 +166,55 @@ if uploaded_file and api_key:
                 st.toast("💾 Master rates saved permanently!", icon="✅")
 
             # 5. The dynamic checking function (using the live edited data)
+            # --- ⚙️ LIVE MASTER RATE MAPPING (CSV DATABASE) ---
+            st.markdown("---")
+            st.subheader("📖 Master Rate Dictionary")
+            st.write("Add new vendor keywords or update rates here. Changes are saved permanently.")
+            
+            RATE_FILE = "master_rates.csv"
+
+            # 1. If the CSV doesn't exist yet, create it with the default pre-populated data
+            if not os.path.exists(RATE_FILE):
+                initial_data = {
+                    "Keywords (Comma Separated)": [
+                        "MANAGEMENT, CARE MGT",
+                        "SOCIAL, SUPPORT",
+                        "PERSONAL, PC",
+                        "DOMESTIC, CLEANING, LAUNDRY, RESPITE, MEAL",
+                        "TRANSPORT, TRIP, TRAVEL, KM"
+                    ],
+                    "Standard": [120.00, 86.20, 83.00, 78.00, 70.00],
+                    "Saturday": [168.00, 120.68, 116.20, 109.20, 98.00],
+                    "Sunday": [204.00, 146.54, 141.10, 132.60, 119.00],
+                    "Public Hol": [264.00, 189.64, 182.60, 171.60, 154.00]
+                }
+                pd.DataFrame(initial_data).to_csv(RATE_FILE, index=False)
+
+            # 2. Load the current rates from the CSV file
+            rate_mapping_df = pd.read_csv(RATE_FILE)
+
+            # 3. Render the editable data grid
+            edited_rates_df = st.data_editor(
+                rate_mapping_df, 
+                num_rows="dynamic", # Allows adding/deleting rows
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # 4. Save changes back to the CSV instantly if your wife edits the table
+            if not edited_rates_df.equals(rate_mapping_df):
+                edited_rates_df.to_csv(RATE_FILE, index=False)
+                st.toast("💾 Master rates saved permanently!", icon="✅")
+
+            # 5. The dynamic checking function (using the live edited data)
             def get_expected_rate(service, day_type):
                 service = str(service).upper()
                 for index, row in edited_rates_df.iterrows():
-                    keywords = [k.strip().upper() for k in str(row["Keywords (Comma Separated)"]).split(",")]
+                    # Safeguard for empty rows
+                    raw_keywords = str(row.get("Keywords (Comma Separated)", ""))
+                    if raw_keywords.strip() == "" or raw_keywords.upper() == "NAN": continue
+                    
+                    keywords = [k.strip().upper() for k in raw_keywords.split(",")]
                     if any(k in service for k in keywords if k): 
                         if day_type == "Saturday": return float(row["Saturday"])
                         elif day_type == "Sunday": return float(row["Sunday"])
