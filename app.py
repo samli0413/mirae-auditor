@@ -114,6 +114,7 @@ if uploaded_file and api_key:
     
     RATE_FILE = "master_rates.csv"
 
+    # 1. Create file if it doesn't exist
     if not os.path.exists(RATE_FILE):
         initial_data = {
             "Keywords (Comma Separated)": [
@@ -130,19 +131,24 @@ if uploaded_file and api_key:
         }
         pd.DataFrame(initial_data).to_csv(RATE_FILE, index=False)
 
-    rate_mapping_df = pd.read_csv(RATE_FILE)
+    # 2. THE FIX: Only read the hard drive ONCE. Put it into memory.
+    if "master_rates_df" not in st.session_state:
+        st.session_state.master_rates_df = pd.read_csv(RATE_FILE)
 
-    # Added key="master_rate_editor" to fix the double-entry bug!
+    # 3. Render the editor using the memory state, NOT the hard drive file
     edited_rates_df = st.data_editor(
-        rate_mapping_df, 
+        st.session_state.master_rates_df, 
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         key="master_rate_editor" 
     )
 
-    if not edited_rates_df.equals(rate_mapping_df):
+    # 4. If an edit is made, save to hard drive AND update the memory
+    if not edited_rates_df.equals(st.session_state.master_rates_df):
         edited_rates_df.to_csv(RATE_FILE, index=False)
+        st.session_state.master_rates_df = edited_rates_df
+        st.rerun() # This forces an instant visual refresh so the math updates instantly!
 
     def get_expected_rate(service, day_type):
         service = str(service).upper()
