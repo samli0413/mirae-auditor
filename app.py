@@ -104,13 +104,34 @@ if uploaded_file and api_key:
 
             def get_expected_rate(service, day_type):
                 service = str(service).upper()
-                if "PERSONAL CARE" in service:
-                    rates = {"Standard": 83.0, "Saturday": 116.2, "Sunday": 146.54, "Public Hol": 182.6}
-                    return rates.get(day_type, 83.0)
-                elif "MEALS" in service or "RESPITE" in service:
-                    rates = {"Standard": 78.0, "Saturday": 109.2, "Sunday": 146.54, "Public Hol": 171.6}
-                    return rates.get(day_type, 78.0)
-                return None 
+    
+                # 1. Care Management
+                if "MANAGEMENT" in service or "CARE MGT" in service:
+                    rates = {"Standard": 120.00, "Saturday": 168.00, "Sunday": 204.00, "Public Hol": 264.00}
+                    return rates.get(day_type, 120.00)
+        
+                # 2. Social Support + Transport (Must be checked BEFORE standalone transport!)
+                elif "SOCIAL" in service or "SUPPORT" in service:
+                    rates = {"Standard": 86.20, "Saturday": 120.68, "Sunday": 146.54, "Public Hol": 189.64}
+                    return rates.get(day_type, 86.20)
+        
+                # 3. Personal Care
+                elif "PERSONAL" in service or "PC" in service:
+                    rates = {"Standard": 83.00, "Saturday": 116.20, "Sunday": 141.10, "Public Hol": 182.60}
+                    return rates.get(day_type, 83.00)
+        
+                # 4. The $78 Tier (Domestic, Respite, Meals, Cleaning, Laundry)
+                elif "DOMESTIC" in service or "CLEANING" in service or "LAUNDRY" in service or "RESPITE" in service or "MEAL" in service:
+                    rates = {"Standard": 78.00, "Saturday": 109.20, "Sunday": 132.60, "Public Hol": 171.60}
+                    return rates.get(day_type, 78.00)
+        
+                # 5. Standalone Transport / Trip / Travel
+                elif "TRANSPORT" in service or "TRIP" in service or "TRAVEL" in service or "KM" in service:
+                    rates = {"Standard": 70.00, "Saturday": 98.00, "Sunday": 119.00, "Public Hol": 154.00}
+                    return rates.get(day_type, 70.00)
+        
+                # If the service isn't recognized at all, leave it blank for manual review
+                return None
 
             def style_day_type(val):
                 if val == 'Public Hol': return 'background-color: #ffcccc; color: #990000;'
