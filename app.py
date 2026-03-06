@@ -250,4 +250,5 @@ if uploaded_file and api_key:
         except Exception as e:
             st.error(f"An error occurred during AI processing: {e}")
 
-elif
+elif uploaded_file and not api_key:
+    st.warning("Please enter your Gemini API key to begin.")
