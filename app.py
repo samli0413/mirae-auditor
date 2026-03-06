@@ -1,386 +1,254 @@
 import streamlit as st
-import pdfplumber
 import pandas as pd
-import re
+import json
 import holidays
-from datetime import datetime
+import tempfile
+import os
+import google.generativeai as genai
 
-# --- CONFIGURATION & PRICING ---
-PRICE_REF = {
-    "CARE MANAGEMENT": {"Standard": 120.0, "Saturday": 168.0, "Sunday": 204.0, "Public Holiday": 264.0},
-    "DOMESTIC": {"Standard": 78.0, "Saturday": 109.2, "Sunday": 132.6, "Public Holiday": 171.6},
-    "PERSONAL CARE": {"Standard": 83.0, "Saturday": 116.2, "Sunday": 141.1, "Public Holiday": 182.6},
-    "RESPITE": {"Standard": 78.0, "Saturday": 109.2, "Sunday": 132.6, "Public Holiday": 171.6},
-    "SOCIAL SUPPORT": {"Standard": 86.2, "Saturday": 120.68, "Sunday": 146.54, "Public Holiday": 189.64},
-    "MEAL PREP": {"Standard": 78.0, "Saturday": 109.2, "Sunday": 132.6, "Public Holiday": 171.6},
-    "TRANSPORT": {"Standard": 70.0, "Saturday": 98.0, "Sunday": 119.0, "Public Holiday": 154.0}
-}
+st.set_page_config(page_title="Invoice Auditor Pro", layout="wide")
+st.title("🧾 Automated Invoice Discrepancy Engine")
 
-# --- HELPER FUNCTIONS ---
-def get_day_type_info(date_str, state_code):
-    try:
-        dt = pd.to_datetime(date_str, dayfirst=True)
-        aus_hols = holidays.Australia(subdiv=state_code)
-        if dt in aus_hols: return "Public Holiday", aus_hols.get(dt)
-        if dt.dayofweek == 5: return "Saturday", None
-        if dt.dayofweek == 6: return "Sunday", None
-        return "Standard", None
-    except: return "Standard", None
+# --- 🔒 API KEY SECURE LOAD ---
+api_key = st.secrets.get("GEMINI_API_KEY", "")
 
-def normalize_date(date_str):
-    try:
-        clean_str = re.sub(r'[-.]', '/', date_str)
-        return pd.to_datetime(clean_str, dayfirst=True).strftime('%d/%m/%Y')
-    except:
-        return date_str
+if not api_key:
+    st.sidebar.warning("API Key not found in Streamlit Secrets.")
+    api_key = st.sidebar.text_input("Enter Gemini API Key to continue:", type="password")
 
-def fetch_val(pat, txt):
-    m = re.search(pat, txt, re.I | re.MULTILINE)
-    if m: return float(m.group(1).replace(',', ''))
-    return 0.0
+# --- 📁 FILE UPLOADER ---
+st.markdown("---")
+uploaded_file = st.file_uploader("Upload Invoice (PDF or Image)", type=['pdf', 'png', 'jpg', 'jpeg'])
 
-def highlight_match(val):
-    if val == 'MATCH':
-        return 'background-color: #d4edda; color: #155724; font-weight: bold;'
-    elif val == 'MISMATCH':
-        return 'background-color: #f8d7da; color: #721c24; font-weight: bold;'
-    return ''
+# --- 🧠 THE PROD AI PROMPT ---
+SYSTEM_PROMPT = """
+Task: You are a strict data extraction OCR tool. I have uploaded a scanned document. 
+Important Note: This document has been physically redacted for privacy using white correction fluid. Completely ignore these blank spaces and focus ONLY on the visible text.
 
-def highlight_day(val):
-    if val == 'Standard':
-        return 'background-color: #e6f2ff; color: #004085;'
-    elif val == 'Saturday':
-        return 'background-color: #fff3cd; color: #856404;'
-    elif val == 'Sunday':
-        return 'background-color: #ffe8cc; color: #854000;'
-    elif val == 'Public Holiday':
-        return 'background-color: #e2d9f3; color: #381885; font-weight: bold;'
-    elif val == 'N/A':
-        return 'color: #6c757d; font-style: italic;'
-    return ''
+CRITICAL RULE: DO NOT calculate, infer, or guess any numbers. Extract ONLY the exact numbers physically printed on the page. If a value is listed as 0.00, $0, or is blank, output 0.0.
 
-# --- CORE EXTRACTION ENGINE ---
-def process_pdf(uploaded_file):
-    summary_rows = []
-    timesheet_hours = {}
-    third_party_totals = []
-    full_text = ""
-    photo_detected = False
+Extract the data and return ONLY a valid JSON object matching this exact structure:
+
+1. "summary_rows": The main grid of billed services. List of objects with:
+- "date" (format DD/MM/YYYY)
+- "service" (string description of the line item exactly as printed)
+- "price" (float, unit price)
+- "qty" (float, quantity/hours billed)
+- "subtotal" (float, total for that line)
+
+2. "timesheet_hours": The physical timesheet logs usually attached behind the invoice. List of objects with:
+- "date" (format DD/MM/YYYY)
+- "worker" (string, name or ID of the carer)
+- "hours" (float, total hours logged for that shift)
+
+3. "third_party_totals": Physical third-party receipts/reimbursements attached (e.g., Pharmacy, Uber). 
+CRITICAL RULE: DO NOT extract handwritten dollar amounts or notes found on the timesheets. ONLY extract totals from official, separate printed vendor receipts.
+List of objects with:
+- "date" (format DD/MM/YYYY of the receipt)
+- "vendor" (string, name of the store/service)
+- "amount" (float, the base amount of the receipt, exactly as printed)
+
+4. "invoice_totals": Final summary figures at the bottom of the main invoice page. Object with:
+- "item_total" (float, subtotal before tax)
+- "gst" (float, exact tax amount printed)
+- "total_due" (float, exact final grand total printed)
+
+5. "client_state": Look for the specific address belonging to the client receiving the care. It is often explicitly labeled with "Address". CRITICAL: Ignore the vendor's billing address and your company's address. Extract ONLY the 2 or 3 letter Australian state abbreviation for the client (e.g., "NSW", "VIC", "QLD").
+"""
+
+if uploaded_file and api_key:
+    genai.configure(api_key=api_key)
     
-    current_doc_type = "UNKNOWN"
-    mirae_summary_ended = False 
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_file_path = tmp_file.name
 
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            full_text += text + "\n"
-            text_upper = text.upper()
-            
-            if len(text.strip()) < 50:
-                photo_detected = True
-                
-            text_clean = re.sub(r'\s+', '', text_upper)
-            
-            # STATE DETECTION
-            if "SERVICECONFIRMATION" in text_clean or "TIMESHEET" in text_clean:
-                current_doc_type = "TIMESHEET"
-            elif "MIRAE" in text_clean and ("TAXINVOICE" in text_clean or "INVOICE" in text_clean):
-                current_doc_type = "MIRAE_SUMMARY"
-            elif current_doc_type == "MIRAE_SUMMARY":
-                if "MIRAE" not in text_clean:
-                    current_doc_type = "THIRD_PARTY"
-            
-            if current_doc_type == "MIRAE_SUMMARY" and mirae_summary_ended:
-                current_doc_type = "THIRD_PARTY"
-            
-            # Mode A: Timesheets 
-            if current_doc_type == "TIMESHEET":
-                extracted_from_page = False
-                tables = page.extract_tables()
-                for table in tables:
-                    for row in table:
-                        if not row or len(row) < 4: continue
-                        date_match = re.search(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", str(row[0]))
-                        if date_match:
-                            date_val = normalize_date(date_match.group(1))
-                            hr_match = re.findall(r"(\d+(?:\.\d+)?)", str(row[3]))
-                            if hr_match:
-                                hours = float(hr_match[-1])
-                                timesheet_hours[date_val] = timesheet_hours.get(date_val, 0) + hours
-                                extracted_from_page = True
-
-                if not extracted_from_page and text.strip():
-                    for line in text.split('\n'):
-                        date_match = re.search(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", line)
-                        if date_match:
-                            date_val = normalize_date(date_match.group(1))
-                            hr_match = re.findall(r"\b(\d+(?:\.\d+)?)\b", line[date_match.end():])
-                            if hr_match:
-                                hours = float(hr_match[-1])
-                                if hours > 24 and len(hr_match) > 1: hours = float(hr_match[-2])
-                                if 0 < hours <= 24:
-                                    timesheet_hours[date_val] = timesheet_hours.get(date_val, 0) + hours
-
-            # Mode B: Mirae Summary
-            elif current_doc_type == "MIRAE_SUMMARY":
-                for line in text.split('\n'):
-                    line = line.strip()
-                    if not line: continue
-                    line_up = line.upper()
-                    
-                    if any(x in line_up for x in ["BALANCE DUE", "BANK DETAILS", "HOW TO PAY"]):
-                        mirae_summary_ended = True
-                        break 
-                    
-                    if re.match(r"^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", line):
-                        parts = line.split()
-                        date_val = normalize_date(parts[0])
-                        remainder = line[len(parts[0]):].strip()
-                        nums_match = re.search(r"((?:\s+[\d,]+\.\d{2}|\s+\d+(?:\.\d+)?)+)$", remainder)
-                        
-                        if nums_match:
-                            nums_str = nums_match.group(1).strip()
-                            service_desc = remainder[:-len(nums_match.group(1))].strip()
-                            nums = nums_str.split()
-                            
-                            if len(nums) >= 3: p, q, s = nums[-3], nums[-2], nums[-1]
-                            elif len(nums) == 2: p, q, s = nums[0], "1", nums[1]
-                            elif len(nums) == 1: p, q, s = nums[0], "1", nums[0]
-                            else: p, q, s = "0.00", "0", "0.00"
-                            summary_rows.append([date_val, service_desc, p, q, s])
-
-                    else:
-                        amt_match = re.search(r"\s+([\d,]+\.\d{2})$", line)
-                        if amt_match and "TAX INVOICE" not in line_up:
-                            amt = amt_match.group(1)
-                            service_desc = line[:-len(amt)].strip()
-                            if len(service_desc) > 3 and not re.search(r"ABN|PAGE", service_desc, re.I):
-                                summary_rows.append(["", service_desc, "0.00", "1", amt])
-
-            # Mode C: Third Party
-            elif current_doc_type == "THIRD_PARTY":
-                m = re.search(r"(?:TOTAL|Amount\s+Due|Balance|Payable|Charge|Subtotals).*?\$?\s*([\d,]+\.\d{2})", text, re.I | re.MULTILINE)
-                if m: 
-                    third_party_totals.append(float(m.group(1).replace(',', '').replace('$', '')))
-                else:
-                    amounts = re.findall(r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b", text)
-                    if amounts:
-                        floats = [float(a.replace(',', '')) for a in amounts]
-                        third_party_totals.append(max(floats))
-
-    df = pd.DataFrame(summary_rows, columns=["Date", "Service", "Price", "Qty", "Subtotal"])
-    for col in ['Price', 'Qty', 'Subtotal']:
-        df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-    
-    return df, timesheet_hours, third_party_totals, full_text, photo_detected
-
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="Mirae Smart Auditor", layout="wide")
-st.title("Mirae Smart Auditor")
-
-uploaded_file = st.file_uploader("Upload Tax Invoice (PDF)", type="pdf")
-
-if uploaded_file:
-    with st.spinner("Extracting and auditing data..."):
-        summary_df, auto_timesheet_hours, third_party_totals, full_text, photo_detected = process_pdf(uploaded_file)
-        
-        if photo_detected:
-            st.toast("Scanned timesheet detected! Please verify hours manually in the Timesheet Verification tab.", icon="⚠️")
-            
-        res_state = "VIC" if re.search(r"\bVIC\b|Victoria", full_text, re.I) else "NSW"
-
-        audit_list = []
-        for _, row in summary_df.iterrows():
-            is_third_party = (str(row['Date']).strip() == "")
-            dtype, _ = get_day_type_info(row['Date'], res_state) if not is_third_party else ("N/A", None)
-            
-            exp_unit_price = 0.0
-            if not is_third_party:
-                for key in PRICE_REF:
-                    if key in str(row['Service']).upper():
-                        exp_unit_price = PRICE_REF[key].get(dtype, 0.0); break
-                match_status = "MATCH" if abs(exp_unit_price - row['Price']) < 0.01 else "MISMATCH"
-            else:
-                exp_unit_price = row['Price'] if row['Price'] > 0 else row['Subtotal']
-                match_status = "N/A"
-                
-            audit_list.append({"Day": dtype, "Expected Unit": exp_unit_price, "Match": match_status})
-        
-        audit_meta_df = pd.DataFrame(audit_list)
-
-        s_it = fetch_val(r"Item\s*Total\s*[:$]*\s*([\d,]+\.\d{2})", full_text)
-        s_gst = fetch_val(r"GST\s*[:$]*\s*([\d,]+\.\d{2})", full_text)
-        s_tot = fetch_val(r"(?<!Item\s)Total\s*[:$]*\s*([\d,]+\.\d{2})", full_text)
-
-        st.sidebar.write(f"**Detected State:** {res_state}")
-
-        t1, t2, t3, t4, t5 = st.tabs([
-            "1. Summary Data", 
-            "2. Unit Price Audit", 
-            "3. Timesheet Verification", 
-            "4. Third-Party Receipts", 
-            "5. Final Financial Audit"
-        ])
-        
-        with t1:
-            st.write("### Extracted Summary Table")
-            clean_view_df = pd.concat([summary_df.reset_index(drop=True), audit_meta_df[['Day']]], axis=1)
-            st.dataframe(clean_view_df, use_container_width=True, hide_index=True)
-        
-        with t2:
-            st.write("### Unit Price Validation")
-            display_audit_df = pd.concat([
-                summary_df[['Date', 'Service', 'Qty', 'Price']].reset_index(drop=True), 
-                audit_meta_df[['Day', 'Expected Unit', 'Match']]
-            ], axis=1)
-            display_audit_df = display_audit_df.rename(columns={"Price": "Billed Unit"})
-            try:
-                styled_df = display_audit_df.style.map(highlight_match, subset=['Match']).map(highlight_day, subset=['Day'])
-            except AttributeError:
-                styled_df = display_audit_df.style.applymap(highlight_match, subset=['Match']).applymap(highlight_day, subset=['Day'])
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
-
-        with t3:
-            st.write("### Source of Truth: Timesheet Verification")
-            st.info("💡 **Auditor Input Required:** Verify the hours below. The app will wait for you to finish typing. Click **Confirm & Save Hours** when done.")
-            
-            summary_dates = [d for d in summary_df['Date'] if str(d).strip() != ""]
-            for d in summary_dates:
-                if d not in auto_timesheet_hours:
-                    auto_timesheet_hours[d] = 0.0 
-                    
-            init_data = [{"Date": d, "Verified Hours": auto_timesheet_hours[d]} for d in sorted(auto_timesheet_hours.keys())]
-            if not init_data: init_data = [{"Date": "", "Verified Hours": 0.0}]
-            log_df = pd.DataFrame(init_data)
-            
-            with st.form("timesheet_form"):
-                edited_log_df = st.data_editor(log_df, num_rows="dynamic", use_container_width=True, key="timesheet_editor")
-                submit_button = st.form_submit_button("Confirm & Save Hours")
-            
-            verified_hrs_dict = edited_log_df[edited_log_df['Date'].str.strip() != ""].groupby('Date')['Verified Hours'].sum().to_dict()
-            
-            st.write("---")
-            st.write("#### Timesheet vs Summary Cross-Check")
-            sum_hrs = summary_df[summary_df['Date'] != ""].groupby('Date')['Qty'].sum()
-            all_dates = sorted(list(set(sum_hrs.index).union(set(verified_hrs_dict.keys()))))
-            
-            for d in all_dates:
-                sh = sum_hrs.get(d, 0.0)
-                lh = verified_hrs_dict.get(d, 0.0)
-                c_data, c_status = st.columns([6, 1])
-                c_data.write(f"**{d}** | Verified Entry: **{lh}** hrs vs Billed Summary: **{sh}** hrs")
-                if abs(lh - sh) < 0.01: c_status.success("MATCH")
-                else: c_status.error("MISMATCH")
-
-        with t4:
-            st.write("### Source of Truth: Third-Party Receipts")
-            st.info("💡 **Auditor Input Required:** Verify the raw receipt amounts below. The app will automatically calculate the 10% surcharge for each item.")
-            
-            # 1. The Raw Input Editor
-            tp_init_data = [{"Receipt Ref": f"Extracted Receipt {i+1}", "Raw Amount ($)": val} for i, val in enumerate(third_party_totals)]
-            if not tp_init_data: tp_init_data = [{"Receipt Ref": "Manual Entry 1", "Raw Amount ($)": 0.0}]
-            tp_df = pd.DataFrame(tp_init_data)
-            
-            with st.form("third_party_form"):
-                edited_tp_df = st.data_editor(tp_df, num_rows="dynamic", use_container_width=True, key="tp_editor")
-                st.form_submit_button("Confirm & Calculate")
-                
-            # 2. The Auto-Calculation Breakdown
-            st.write("#### 1. Your Calculated Receipt Breakdown")
-            
-            # Perform the math row-by-row
-            edited_tp_df['10% Surcharge ($)'] = (edited_tp_df['Raw Amount ($)'] * 0.10).round(2)
-            edited_tp_df['Total Calculated ($)'] = (edited_tp_df['Raw Amount ($)'] + edited_tp_df['10% Surcharge ($)']).round(2)
-            
-            # Force Streamlit to display two decimal places for currency
-            st.dataframe(
-                edited_tp_df, 
-                use_container_width=True, 
-                hide_index=True,
-                column_config={
-                    "Raw Amount ($)": st.column_config.NumberColumn(format="%.2f"),
-                    "10% Surcharge ($)": st.column_config.NumberColumn(format="%.2f"),
-                    "Total Calculated ($)": st.column_config.NumberColumn(format="%.2f")
-                }
+    with st.spinner("🤖 AI is reading and extracting the invoice data..."):
+        try:
+            # 1. Upload & Process via Gemini
+            gemini_file = genai.upload_file(tmp_file_path)
+            model = genai.GenerativeModel(
+                model_name='gemini-2.5-flash',
+                generation_config={"response_mime_type": "application/json"}
             )
+            response = model.generate_content([gemini_file, SYSTEM_PROMPT])
+            data = json.loads(response.text)
             
-            # 3. Vendor's Summary Claim
-            st.write("#### 2. Claimed on Vendor Summary")
-            summary_tp_df = summary_df[summary_df['Date'] == ''][['Service', 'Subtotal']].rename(columns={"Service": "Billed Item", "Subtotal": "Claimed Total ($)"})
+            # Clean up files
+            os.remove(tmp_file_path)
+            genai.delete_file(gemini_file.name)
             
-            if summary_tp_df.empty:
-                st.write("*No third-party items found on the summary page.*")
-            else:
-                st.dataframe(
-                    summary_tp_df, 
-                    use_container_width=True, 
-                    hide_index=True,
-                    column_config={"Claimed Total ($)": st.column_config.NumberColumn(format="%.2f")}
-                )
-            
-            # 4. The Final Cross-Check
-            verified_tp_sum = edited_tp_df['Total Calculated ($)'].sum()
-            claimed_tp_sum = summary_tp_df['Claimed Total ($)'].sum()
-            
-            st.write("---")
-            st.write("#### 3. Receipts vs Summary Cross-Check")
-            
-            c_data, c_status = st.columns([6, 1])
-            c_data.write(f"**Calculated from Receipts:** **${verified_tp_sum:,.2f}** vs **Billed on Summary:** **${claimed_tp_sum:,.2f}**")
-            if abs(verified_tp_sum - claimed_tp_sum) < 0.01: c_status.success("MATCH")
-            else: c_status.error("MISMATCH")
+            st.toast("Extraction Complete! Rendering Dashboard...", icon="✅")
 
-        with t5:
-            st.write("### Final Financial Reconciliation")
+            # --- 🗓️ DYNAMIC HOLIDAY LOGIC (Auto-Detected State) ---
+            client_state = data.get("client_state", "NSW").upper()
             
-            expected_taxable_subtotal = 0.0
-            
-            # Send the fully calculated total straight to the final math
-            expected_nontaxable_subtotal = verified_tp_sum 
-            
-            available_verified_hrs = verified_hrs_dict.copy()
-
-            for i, row in summary_df.iterrows():
-                is_third_party = (str(row['Date']).strip() == "")
+            # Fallback cleanup just in case the AI grabs punctuation
+            valid_states = ["NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"]
+            if client_state not in valid_states:
+                client_state = "NSW" # Safe default
                 
-                if not is_third_party:
-                    billed_unit_price = row['Price'] 
-                    date_val = row['Date']
-                    billed_qty = row['Qty']
-                    
-                    available = available_verified_hrs.get(date_val, 0.0)
-                    qty_to_use = min(billed_qty, available) if billed_qty > 0 else 0.0
-                    
-                    expected_taxable_subtotal += (billed_unit_price * qty_to_use)
-                    available_verified_hrs[date_val] = round(available - qty_to_use, 2)
+            st.info(f"📍 **Auto-Detected Client State:** {client_state}")
 
-            calc_gst = round(expected_taxable_subtotal * 0.1, 2)
-            calc_grand_total = expected_taxable_subtotal + expected_nontaxable_subtotal + calc_gst
+            state_holidays = holidays.AU(subdiv=client_state, years=2026)
+
+            def get_day_type(date_str):
+                try:
+                    dt = pd.to_datetime(date_str, format="%d/%m/%Y")
+                    if dt in state_holidays: return "Public Hol"
+                    if dt.weekday() == 5: return "Saturday"
+                    if dt.weekday() == 6: return "Sunday"
+                    return "Standard"
+                except:
+                    return "Unknown"
+
+            def get_expected_rate(service, day_type):
+                service = str(service).upper()
+                if "PERSONAL CARE" in service:
+                    rates = {"Standard": 83.0, "Saturday": 116.2, "Sunday": 146.54, "Public Hol": 182.6}
+                    return rates.get(day_type, 83.0)
+                elif "MEALS" in service or "RESPITE" in service:
+                    rates = {"Standard": 78.0, "Saturday": 109.2, "Sunday": 146.54, "Public Hol": 171.6}
+                    return rates.get(day_type, 78.0)
+                return None 
+
+            def style_day_type(val):
+                if val == 'Public Hol': return 'background-color: #ffcccc; color: #990000;'
+                elif val == 'Sunday': return 'background-color: #ffe6cc; color: #cc6600;'
+                elif val == 'Saturday': return 'background-color: #ffffcc; color: #999900;'
+                return ''
+
+            def style_variance(val):
+                if pd.isna(val): return ''
+                if val > 0: return 'background-color: #ffcccc; color: #990000; font-weight: bold;'
+                elif val < 0: return 'background-color: #ffffcc; color: #999900; font-weight: bold;'
+                return 'color: green;'
+
+            df = pd.DataFrame(data.get("summary_rows", []))
             
-            st.markdown(f"""
-            **Breakdown of your Verified Math:**
-            * **Taxable Services:** ${expected_taxable_subtotal:,.2f} *(Calculated from Tab 3 Hours x Vendor's Unit Price)*
-            * **Non-Taxable Items (3rd Party + Surcharges):** ${expected_nontaxable_subtotal:,.2f} *(Pulled strictly from Tab 4 Calculated Totals)*
-            """)
-            
-            col1, col2, col3 = st.columns(3)
-            user_it = col1.number_input("PDF Item Total ($)", value=float(s_it), format="%.2f")
-            user_gst = col2.number_input("PDF GST ($)", value=float(s_gst), format="%.2f")
-            user_tot = col3.number_input("PDF Grand Total ($)", value=float(s_tot), format="%.2f")
-            
-            st.write("---")
-            st.write("#### Bottom-Line Comparison")
-            recon_data = [
-                {"Metric": "Verified Item Total", "Calc": expected_taxable_subtotal + expected_nontaxable_subtotal, "Summary": user_it},
-                {"Metric": "Verified GST (10%)", "Calc": calc_gst, "Summary": user_gst},
-                {"Metric": "Verified Grand Total", "Calc": calc_grand_total, "Summary": user_tot}
-            ]
-            
-            for m in recon_data:
-                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                diff = round(m['Calc'] - m['Summary'], 2)
-                c1.write(f"**{m['Metric']}**")
-                c2.write(f"System Calculated: ${m['Calc']:,.2f}")
-                c3.write(f"Billed by Vendor: ${m['Summary']:,.2f}")
-                if abs(diff) < 0.05: c4.success("MATCH")
-                else: c4.error(f"OVERCHARGED: ${abs(diff):,.2f}" if diff < 0 else f"UNDERCHARGED: ${diff:,.2f}")
+            if not df.empty:
+                # --- ⚙️ PROCESSING CARE DATA ---
+                df_care = df[~df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT|UBER', case=False, na=False)].copy()
+
+                df_care["Day Type"] = df_care["date"].apply(get_day_type)
+                df_care["Calculated Rate"] = df_care.apply(lambda row: get_expected_rate(row["service"], row["Day Type"]), axis=1)
+                
+                # New Logic: Subtotal Math Validation
+                df_care["Calculated Subtotal (Truth)"] = df_care["Calculated Rate"] * df_care["qty"]
+                
+                # Matches
+                df_care["Rate Match"] = df_care.apply(lambda row: "✅" if pd.notna(row["Calculated Rate"]) and abs(row["price"] - row["Calculated Rate"]) <= 0.05 else "❌", axis=1)
+                df_care["Subtotal Match"] = df_care.apply(lambda row: "✅" if pd.notna(row["Calculated Subtotal (Truth)"]) and abs(row["subtotal"] - row["Calculated Subtotal (Truth)"]) <= 0.05 else "❌", axis=1)
+
+                display_care_df = df_care[["date", "service", "Day Type", "Calculated Rate", "price", "Rate Match", "qty", "Calculated Subtotal (Truth)", "subtotal", "Subtotal Match"]]
+                display_care_df = display_care_df.rename(columns={
+                    "date": "Service Date", 
+                    "service": "Service", 
+                    "price": "Extracted Rate (Summary)",
+                    "qty": "Extracted Qty", 
+                    "subtotal": "Extracted Subtotal (Summary)"
+                })
+                styled_care_df = display_care_df.style.map(style_day_type, subset=['Day Type'])
+
+                # --- 🖥️ UI LAYOUT ---
+
+                # ---------------------------------------------------------
+                # SECTION 1: TOTALS
+                # ---------------------------------------------------------
+                st.header("📊 1. Main Invoice Totals Check")
+                calc_item_total = df["subtotal"].sum()
+                
+                inv_totals = data.get("invoice_totals", {})
+                ext_item_total = inv_totals.get("item_total", 0.0)
+                ext_gst = inv_totals.get("gst", 0.0)
+                ext_grand = inv_totals.get("total_due", 0.0)
+                
+                calc_grand = calc_item_total + ext_gst 
+
+                totals_data = {
+                    "Metric": ["Item Total", "GST", "Grand Total"],
+                    "Extracted (Summary Page)": [f"${ext_item_total:.2f}", f"${ext_gst:.2f}", f"${ext_grand:.2f}"],
+                    "Calculated (Source of Truth)": [f"${calc_item_total:.2f}", f"${ext_gst:.2f}", f"${calc_grand:.2f}"],
+                    "Status": [
+                        "✅ Match" if abs(ext_item_total - calc_item_total) <= 0.05 else "❌ Mismatch",
+                        "✅ Match",
+                        "✅ Match" if abs(ext_grand - calc_grand) <= 0.05 else "❌ Mismatch"
+                    ]
+                }
+                st.table(pd.DataFrame(totals_data).set_index("Metric"))
+                st.markdown("---")
+
+                # ---------------------------------------------------------
+                # SECTION 2: CARE SERVICES & RATES
+                # ---------------------------------------------------------
+                st.header("🗓️ 2. Care Services & Rate Audit")
+                st.write("Cross-checking rates and ensuring the line-item math (`Rate` × `Qty`) equals the printed subtotal.")
+                st.dataframe(styled_care_df, use_container_width=True, hide_index=True)
+                st.markdown("---")
+
+                # ---------------------------------------------------------
+                # SECTION 3: TIMESHEET RECONCILIATION
+                # ---------------------------------------------------------
+                st.header("⏱️ 3. Timesheet Reconciliation")
+                st.write("Cross-checking the total hours extracted from the summary page against the physical timesheet logs.")
+
+                timesheet_data = data.get("timesheet_hours", [])
+                if timesheet_data:
+                    daily_extracted = df_care.groupby("date")["qty"].sum().reset_index().rename(columns={"date": "Date", "qty": "Extracted Hours (Summary)"})
+                    timesheet_df = pd.DataFrame(timesheet_data)
+                    daily_calculated = timesheet_df.groupby("date")["hours"].sum().reset_index().rename(columns={"date": "Date", "hours": "Calculated Hours (Timesheet)"})
+
+                    recon_df = pd.merge(daily_extracted, daily_calculated, on="Date", how="outer").fillna(0)
+                    recon_df["Variance"] = recon_df["Extracted Hours (Summary)"] - recon_df["Calculated Hours (Timesheet)"]
+
+                    def get_timesheet_status(variance):
+                        if variance > 0.05: return "🚨 Overbilled"
+                        elif variance < -0.05: return "⚠️ Underbilled"
+                        return "✅ Match"
+
+                    recon_df["Status"] = recon_df["Variance"].apply(get_timesheet_status)
+                    styled_recon = recon_df.style.map(style_variance, subset=['Variance'])
+                    st.dataframe(styled_recon, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No timesheet hours were found in this document.")
+                st.markdown("---")
+
+                # ---------------------------------------------------------
+                # SECTION 4: ITEMIZED THIRD-PARTY RECEIPTS
+                # ---------------------------------------------------------
+                st.header("💊 4. Itemized Third-Party Receipts & Surcharges")
+                st.write("Line-by-line cross-check of extracted vendor claims vs. actual calculated receipt evidence.")
+
+                tp_data_list = data.get("third_party_totals", [])
+                df_tp = df[df['service'].str.contains('PHARMACY|SURCHARGE|REIMBURSEMENT|UBER', case=False, na=False)].copy()
+                
+                if tp_data_list or not df_tp.empty:
+                    receipts_df = pd.DataFrame(tp_data_list)
+                    if not receipts_df.empty:
+                        receipts_df = receipts_df.rename(columns={"date": "Date", "vendor": "Receipt Vendor", "amount": "Calculated Base"})
+                        receipts_df["Calculated Surcharge"] = receipts_df["Calculated Base"] * 0.10
+                    else:
+                        receipts_df = pd.DataFrame(columns=["Date", "Receipt Vendor", "Calculated Base", "Calculated Surcharge"])
+
+                    is_surcharge = df_tp['service'].str.contains('SURCHARGE', case=False, na=False)
+                    ext_base = df_tp[~is_surcharge].groupby('date')['subtotal'].sum().reset_index().rename(columns={"date": "Date", "subtotal": "Extracted Base (Summary)"})
+                    ext_sur = df_tp[is_surcharge].groupby('date')['subtotal'].sum().reset_index().rename(columns={"date": "Date", "subtotal": "Extracted Surcharge (Summary)"})
+
+                    tp_recon = receipts_df.merge(ext_base, on="Date", how="outer").merge(ext_sur, on="Date", how="outer").fillna(0)
+
+                    tp_recon["Base Match"] = tp_recon.apply(lambda r: "✅" if abs(r["Extracted Base (Summary)"] - r.get("Calculated Base", 0)) <= 0.05 else f"❌ Mismatch (+${(r['Extracted Base (Summary)'] - r.get('Calculated Base', 0)):.2f})", axis=1)
+                    tp_recon["Surcharge Match"] = tp_recon.apply(lambda r: "✅" if abs(r["Extracted Surcharge (Summary)"] - r.get("Calculated Surcharge", 0)) <= 0.05 else f"❌ Mismatch (+${(r['Extracted Surcharge (Summary)'] - r.get('Calculated Surcharge', 0)):.2f})", axis=1)
+
+                    display_tp = tp_recon[["Date", "Receipt Vendor", "Calculated Base", "Extracted Base (Summary)", "Base Match", "Calculated Surcharge", "Extracted Surcharge (Summary)", "Surcharge Match"]]
+                    st.dataframe(display_tp, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No third-party reimbursements or surcharges found in this document.")
+
+            else:
+                st.error("No service rows were extracted. Please check the PDF quality or prompt.")
+                
+        except Exception as e:
+            st.error(f"An error occurred during AI processing: {e}")
+
+elif uploaded_file and not api_key:
+    st.warning("Please enter your Gemini API key to begin.")
