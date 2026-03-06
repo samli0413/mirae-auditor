@@ -216,7 +216,7 @@ if uploaded_file and api_key:
         # SECTION 1: FORENSIC TOTALS
         # ---------------------------------------------------------
         st.header("📊 1. Forensic Invoice Totals (Source of Truth)")
-        st.write("This table reconstructs the entire invoice using ONLY your master rate mapping, physical receipt evidence, and strict 10% GST.")
+        st.write("This table reconstructs the entire invoice using ONLY your master rate mapping, physical receipt evidence, and strict 10% GST on care services.")
         
         inv_totals = data.get("invoice_totals", {})
         ext_item_total = inv_totals.get("item_total", 0.0)
@@ -227,8 +227,8 @@ if uploaded_file and api_key:
         true_care_total = df_care["Calculated Subtotal (Truth)"].sum(skipna=True)
         true_item_total = true_care_total + true_tp_base + true_tp_surcharge
         
-        # 2. Strict 10% GST applied to the True Total
-        true_gst = true_item_total * 0.10
+        # 2. Strict 10% GST (Applied ONLY to Care Services, excluding Third-Party pass-throughs)
+        true_gst = true_care_total * 0.10
         
         # 3. Calculate the Pure Truth Grand Total
         true_grand_total = true_item_total + true_gst 
