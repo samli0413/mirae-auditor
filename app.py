@@ -5,6 +5,7 @@ import holidays
 import tempfile
 import os
 import google.generativeai as genai
+from datetime import datetime
 
 st.set_page_config(page_title="Invoice Auditor Pro", layout="wide")
 st.title("🧾 Automated Invoice Discrepancy Engine")
@@ -36,10 +37,14 @@ Extract the data and return ONLY a valid JSON object matching this exact structu
 - "qty" (float, quantity/hours billed)
 - "subtotal" (float, total for that line)
 
-2. "timesheet_hours": The physical timesheet logs usually attached behind the invoice. List of objects with:
+2. "timesheet_hours": The physical timesheet logs usually attached behind the invoice. 
+CRITICAL LAYOUT RULE: Look for the column header "TIME". Directly underneath it, you will find "START" and "FINISH". Extract the times associated with those columns.
+List of objects with:
 - "date" (format DD/MM/YYYY)
 - "worker" (string, name or ID of the carer)
-- "hours" (float, total hours logged for that shift)
+- "start_time" (string, exact start time e.g., "09:00 AM" or "14:00". Output "" if blank)
+- "finish_time" (string, exact finish time e.g., "01:00 PM" or "17:00". Output "" if blank)
+- "written_hours" (float, total hours manually written/logged for that shift. Output 0.0 if blank)
 
 3. "third_party_totals": Physical third-party receipts/reimbursements attached (e.g., Pharmacy, Uber). 
 CRITICAL RULE: DO NOT extract handwritten dollar amounts or notes found on the timesheets. ONLY extract totals from official, separate printed vendor receipts.
@@ -66,7 +71,7 @@ if uploaded_file and api_key:
             tmp_file.write(uploaded_file.getvalue())
             tmp_file_path = tmp_file.name
 
-        with st.spinner("🤖 AI is reading the invoice... (This only happens once per file!)"):
+        with st.spinner("🤖 AI is reading the invoice and timesheets... (This only happens once per file!)"):
             try:
                 gemini_file = genai.upload_file(tmp_file_path)
                 model = genai.GenerativeModel(
@@ -114,7 +119,6 @@ if uploaded_file and api_key:
     
     RATE_FILE = "master_rates.csv"
 
-    # 1. Create file if it doesn't exist
     if not os.path.exists(RATE_FILE):
         initial_data = {
             "Keywords (Comma Separated)": [
@@ -131,11 +135,9 @@ if uploaded_file and api_key:
         }
         pd.DataFrame(initial_data).to_csv(RATE_FILE, index=False)
 
-    # 2. THE FIX: Only read the hard drive ONCE. Put it into memory.
     if "master_rates_df" not in st.session_state:
         st.session_state.master_rates_df = pd.read_csv(RATE_FILE)
 
-    # 3. Render the editor using the memory state, NOT the hard drive file
     edited_rates_df = st.data_editor(
         st.session_state.master_rates_df, 
         num_rows="dynamic",
@@ -144,11 +146,10 @@ if uploaded_file and api_key:
         key="master_rate_editor" 
     )
 
-    # 4. If an edit is made, save to hard drive AND update the memory
     if not edited_rates_df.equals(st.session_state.master_rates_df):
         edited_rates_df.to_csv(RATE_FILE, index=False)
         st.session_state.master_rates_df = edited_rates_df
-        st.rerun() # This forces an instant visual refresh so the math updates instantly!
+        st.rerun()
 
     def get_expected_rate(service, day_type):
         service = str(service).upper()
@@ -223,14 +224,9 @@ if uploaded_file and api_key:
         ext_gst = inv_totals.get("gst", 0.0)
         ext_grand = inv_totals.get("total_due", 0.0)
         
-        # 1. Calculate the Pure Truth Base Total
         true_care_total = df_care["Calculated Subtotal (Truth)"].sum(skipna=True)
         true_item_total = true_care_total + true_tp_base + true_tp_surcharge
-        
-        # 2. Strict 10% GST (Applied ONLY to Care Services, excluding Third-Party pass-throughs)
         true_gst = true_care_total * 0.10
-        
-        # 3. Calculate the Pure Truth Grand Total
         true_grand_total = true_item_total + true_gst 
         
         variance = ext_grand - true_grand_total
@@ -257,46 +253,86 @@ if uploaded_file and api_key:
         st.markdown("---")
 
         # ---------------------------------------------------------
-        # SECTION 3: TIMESHEET RECONCILIATION (NOW EDITABLE)
+        # SECTION 3: TIMESHEET RECONCILIATION (WITH TIME MATH)
         # ---------------------------------------------------------
-        st.header("⏱️ 3. Timesheet Reconciliation")
-        st.write("If the AI misread messy handwriting, **you can edit or delete rows directly in the timesheet data below** to correct it!")
+        st.header("⏱️ 3. Timesheet Reconciliation (Start/Finish Truth)")
+        st.write("The app calculates exact hours based on Start/Finish times. **If a time is misread, edit it below and the math will instantly update!**")
 
-        # Initialize timesheet data in session state so edits stick
+        # Initialize timesheet data
         if "timesheet_df" not in st.session_state or st.session_state.get("ts_file") != uploaded_file.name:
-            st.session_state.timesheet_df = pd.DataFrame(data.get("timesheet_hours", []))
+            raw_ts = data.get("timesheet_hours", [])
+            st.session_state.timesheet_df = pd.DataFrame(raw_ts)
             st.session_state.ts_file = uploaded_file.name
 
         if not st.session_state.timesheet_df.empty:
             
-            # The editable AI extracted data
+            # Ensure all columns exist even if the AI missed one
+            for col in ["date", "worker", "start_time", "finish_time", "written_hours"]:
+                if col not in st.session_state.timesheet_df.columns:
+                    st.session_state.timesheet_df[col] = "" if "time" in col or col in ["date", "worker"] else 0.0
+
+            # Provide the editable grid for the raw data
             edited_ts_df = st.data_editor(
-                st.session_state.timesheet_df, 
+                st.session_state.timesheet_df[["date", "worker", "start_time", "finish_time", "written_hours"]], 
                 num_rows="dynamic", 
                 use_container_width=True, 
                 hide_index=True,
                 key="timesheet_editor"
             )
             
-            # Save the edits to memory
             st.session_state.timesheet_df = edited_ts_df
 
-            # Do the math using the EDITED dataframe
-            daily_extracted = df_care.groupby("date")["qty"].sum().reset_index().rename(columns={"date": "Date", "qty": "Extracted Hours (Summary)"})
-            daily_calculated = edited_ts_df.groupby("date")["hours"].sum().reset_index().rename(columns={"date": "Date", "hours": "Calculated Hours (Timesheet)"})
+            # The Python math brain that calculates the absolute truth
+            def calc_true_hours(row):
+                try:
+                    start_str = str(row.get('start_time', '')).strip()
+                    finish_str = str(row.get('finish_time', '')).strip()
+                    if not start_str or not finish_str:
+                        return float(row.get('written_hours', 0.0))
+                    
+                    # Prepend a dummy date so Python's time logic doesn't freak out
+                    dummy_date = "2000-01-01 "
+                    start = pd.to_datetime(dummy_date + start_str)
+                    finish = pd.to_datetime(dummy_date + finish_str)
+                    
+                    if finish < start: # Catch overnight shifts just in case
+                        finish += pd.Timedelta(days=1)
+                        
+                    return round((finish - start).total_seconds() / 3600.0, 2)
+                except:
+                    # If handwriting is completely illegible, fallback to what they wrote
+                    return float(row.get('written_hours', 0.0))
+
+            edited_ts_df["Calculated Truth (Hours)"] = edited_ts_df.apply(calc_true_hours, axis=1)
+            
+            # Flag bad worker math
+            edited_ts_df["Worker Math Flag"] = edited_ts_df.apply(
+                lambda r: "🚨 Bad Math" if pd.notna(r["Calculated Truth (Hours)"]) and pd.notna(r.get("written_hours")) and abs(r["Calculated Truth (Hours)"] - float(r.get("written_hours", 0))) > 0.05 else "✅ OK", 
+                axis=1
+            )
+
+            # Show the internal timesheet check
+            st.write("🔍 **Internal Timesheet Check:** Did the worker calculate their own shift correctly?")
+            display_ts = edited_ts_df[["date", "worker", "start_time", "finish_time", "Calculated Truth (Hours)", "written_hours", "Worker Math Flag"]]
+            st.dataframe(display_ts.style.map(lambda v: 'background-color: #ffcccc; color: #990000; font-weight: bold;' if v == '🚨 Bad Math' else '', subset=['Worker Math Flag']), use_container_width=True, hide_index=True)
+
+            # Do the final Vendor audit math using the TRUE Calculated Hours
+            daily_extracted = df_care.groupby("date")["qty"].sum().reset_index().rename(columns={"date": "Date", "qty": "Billed Hours (Invoice)"})
+            daily_calculated = edited_ts_df.groupby("date")["Calculated Truth (Hours)"].sum().reset_index().rename(columns={"date": "Date", "Calculated Truth (Hours)": "True Hours (Timesheet)"})
 
             recon_df = pd.merge(daily_extracted, daily_calculated, on="Date", how="outer").fillna(0)
-            recon_df["Variance"] = recon_df["Extracted Hours (Summary)"] - recon_df["Calculated Hours (Timesheet)"]
+            recon_df["Variance"] = recon_df["Billed Hours (Invoice)"] - recon_df["True Hours (Timesheet)"]
 
             def get_timesheet_status(variance):
-                if variance > 0.05: return "🚨 Overbilled"
-                elif variance < -0.05: return "⚠️ Underbilled"
+                if variance > 0.05: return "🚨 Vendor Overbilled"
+                elif variance < -0.05: return "⚠️ Vendor Underbilled"
                 return "✅ Match"
 
             recon_df["Status"] = recon_df["Variance"].apply(get_timesheet_status)
             styled_recon = recon_df.style.map(style_variance, subset=['Variance'])
             
-            st.subheader("Final Match Result")
+            st.subheader("Final Invoice Match Result")
+            st.write("Comparing the exact calculated timesheet hours to what the vendor billed on page 1.")
             st.dataframe(styled_recon, use_container_width=True, hide_index=True)
         else:
             st.info("No timesheet hours were found in this document.")
@@ -312,8 +348,6 @@ if uploaded_file and api_key:
         
         if tp_data_list or not df_tp.empty:
             if not receipts_df.empty:
-                # FIX: We only rename Date and Vendor here. 
-                # "Calculated Base" already exists perfectly from the math we did earlier!
                 receipts_df = receipts_df.rename(columns={"date": "Date", "vendor": "Receipt Vendor"})
             else:
                 receipts_df = pd.DataFrame(columns=["Date", "Receipt Vendor", "Calculated Base", "Calculated Surcharge"])
@@ -324,7 +358,6 @@ if uploaded_file and api_key:
 
             tp_recon = receipts_df.merge(ext_base, on="Date", how="outer").merge(ext_sur, on="Date", how="outer").fillna(0)
 
-            # Safely using .get() to prevent any missing column errors
             tp_recon["Base Match"] = tp_recon.apply(lambda r: "✅" if abs(r.get("Extracted Base (Summary)", 0) - r.get("Calculated Base", 0)) <= 0.05 else f"❌ Mismatch (+${(r.get('Extracted Base (Summary)', 0) - r.get('Calculated Base', 0)):.2f})", axis=1)
             tp_recon["Surcharge Match"] = tp_recon.apply(lambda r: "✅" if abs(r.get("Extracted Surcharge (Summary)", 0) - r.get("Calculated Surcharge", 0)) <= 0.05 else f"❌ Mismatch (+${(r.get('Extracted Surcharge (Summary)', 0) - r.get('Calculated Surcharge', 0)):.2f})", axis=1)
 
