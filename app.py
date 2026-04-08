@@ -295,8 +295,20 @@ if uploaded_file and api_key:
                     start = pd.to_datetime(dummy_date + start_str)
                     finish = pd.to_datetime(dummy_date + finish_str)
                     
-                    if finish < start: # Catch overnight shifts just in case
-                        finish += pd.Timedelta(days=1)
+                    # --- 🧠 SMART AM/PM COMMON SENSE FIX ---
+                    if finish < start: 
+                        # Scenario: Start is 12:00 PM, Finish is 3:00 (parsed as 3:00 AM)
+                        # Let's test if assuming PM (+12 hours) makes sense.
+                        test_finish = finish + pd.Timedelta(hours=12)
+                        test_hours = (test_finish - start).total_seconds() / 3600.0
+                        
+                        # If adding 12 hours creates a normal shift (e.g., between 1 and 10 hours)
+                        # we apply the common sense fix!
+                        if 0 < test_hours <= 10:
+                            finish = test_finish
+                        else:
+                            # If it's still weird, assume it was a genuine overnight shift
+                            finish += pd.Timedelta(days=1)
                         
                     return round((finish - start).total_seconds() / 3600.0, 2)
                 except:
