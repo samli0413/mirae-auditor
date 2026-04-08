@@ -100,7 +100,7 @@ if uploaded_file and api_key:
     if client_state not in valid_states:
         client_state = "NSW" 
         
-    state_holidays = holidays.AU(subdiv=client_state, years=2026)
+    state_holidays = holidays.AU(subdiv=client_state)
 
     def get_day_type(date_str):
         try:
