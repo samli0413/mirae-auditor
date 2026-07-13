@@ -8,7 +8,7 @@ import google.generativeai as genai
 from datetime import datetime
 
 st.set_page_config(page_title="Invoice Auditor Pro", layout="wide")
-st.title("🧾 Automated Invoice Discrepancy Engine")
+st.title("🧾 Mirae")
 
 # --- 🔒 API KEY SECURE LOAD ---
 api_key = st.secrets.get("GEMINI_API_KEY", "")
