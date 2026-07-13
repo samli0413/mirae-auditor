@@ -128,10 +128,10 @@ if uploaded_file and api_key:
                 "DOMESTIC, CLEANING, LAUNDRY, RESPITE, MEAL",
                 "TRANSPORT, TRIP, TRAVEL, KM"
             ],
-            "Standard": [120.00, 86.20, 83.00, 78.00, 70.00],
-            "Saturday": [168.00, 120.68, 116.20, 109.20, 98.00],
-            "Sunday": [204.00, 146.54, 141.10, 132.60, 119.00],
-            "Public Hol": [264.00, 189.64, 182.60, 171.60, 154.00]
+            "Standard": [130.00, 86.00, 86.00, 86.00, 70.00],
+            "Saturday": [182.00, 120.40, 120.40, 120.40, 98.00],
+            "Sunday": [221.00, 146.20, 146.20, 146.20, 119.00],
+            "Public Hol": [286.00, 189.20, 189.20, 189.20, 154.00]
         }
         pd.DataFrame(initial_data).to_csv(RATE_FILE, index=False)
 
